@@ -11,3 +11,38 @@ code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
 }
+
+@keyframes flipHeads {
+  from { transform: rotateY(0); }
+  to { transform: rotateY(1800deg); } /* 5 full rotations */
+}
+
+.coin {
+  width: 100px;
+  height: 100px;
+  margin: 20px auto;
+  position: relative;
+  transform-style: preserve-3d;
+  transition: transform 1s ease-in-out;
+}
+
+.coin.flipping {
+  animation: flipHeads 3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.side {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  backface-visibility: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  font-size: 14px;
+  border: 4px solid #fbbf24;
+}
+
+.heads { background: #f59e0b; color: white; }
+.tails { background: #6366f1; color: white; transform: rotateY(180deg); }
