@@ -2,6 +2,24 @@
   text-align: center;
 }
 
+@keyframes flipHeads {
+  from { transform: rotateY(0); }
+  to { transform: rotateY(1800deg); } /* 5 full rotations */
+}
+
+@keyframes flipTails {
+  from { transform: rotateY(0); }
+  to { transform: rotateY(1980deg); } /* 5.5 full rotations */
+}
+
+.coin-flipping-heads {
+  animation: flipHeads 2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.coin-flipping-tails {
+  animation: flipTails 2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
 .App-logo {
   height: 40vmin;
   pointer-events: none;
