@@ -257,7 +257,7 @@ function CoinflipUI() {
         } finally {
             setLoading(false);
         }
-    };
+    };1
 
     const joinAndFlip = async (gamePda, playerOnePubkey, playerOneSide, gameId) => {
         if (!publicKey) return alert("Connect wallet!");

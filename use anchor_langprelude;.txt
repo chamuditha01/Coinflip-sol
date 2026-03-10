@@ -1,175 +1,243 @@
-use anchor_lang::prelude::*;
-use anchor_lang::solana_program::program::invoke;
-use anchor_lang::solana_program::system_instruction;
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint,
+    entrypoint::ProgramResult,
+    msg,
+    program::{invoke, invoke_signed},
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    rent::Rent,
+    system_instruction,
+    sysvar::{slot_hashes, Sysvar},
+};
 
-declare_id!("3pitCpDAFY5jtyYvTUKrUuMHT19GqzA2sea8jhvjJBRq");
+// --- 1. CONSTANTS & STATE ---
+pub const COMMISSION_ADDRESS: Pubkey =
+    solana_program::pubkey!("3FSdF5cDCjkEsrcLEeCDkNBkLLHtpbSiqpxTbcENnydJ");
 
-// Commission Address Constant
-pub const COMMISSION_ADDRESS: Pubkey = solana_program::pubkey!("3FSdF5cDCjkEsrcLEeCDkNBkLLHtpbSiqpxTbcENnydJ");
-
-
-#[program]
-pub mod solana_coinflip {
-    use super::*;
-
-    pub fn create_game(
-        ctx: Context<CreateGame>,
-        game_id: u64,
-        amount: u64,
-        side: u8,
-    ) -> Result<()> {
-        let game = &mut ctx.accounts.game;
-        game.player_one = ctx.accounts.player_one.key();
-        game.player_two = Pubkey::default();
-        game.amount = amount;
-        game.player_one_side = side;
-        game.game_id = game_id;
-        game.status = 0; // 0: Open
-
-        let ix = system_instruction::transfer(&ctx.accounts.player_one.key(), &game.key(), amount);
-        invoke(
-            &ix,
-            &[
-                ctx.accounts.player_one.to_account_info(),
-                game.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        emit!(GameCreated {
-            game_id,
-            player_one: game.player_one,
-            amount
-        });
-        Ok(())
-    }
-
-    pub fn join_and_flip(ctx: Context<JoinAndFlip>) -> Result<()> {
-        let game = &mut ctx.accounts.game;
-        require!(game.status == 0, CoinflipError::GameAlreadyFinished);
-
-        // 1. Set Player Two and collect their bet
-        game.player_two = ctx.accounts.player_two.key();
-
-        let ix = system_instruction::transfer(&ctx.accounts.player_two.key(), &game.key(), game.amount);
-        invoke(
-            &ix,
-            &[
-                ctx.accounts.player_two.to_account_info(),
-                game.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        // 2. Perform the Flip immediately
-        let clock = Clock::get()?;
-        let flip_result = (clock.unix_timestamp % 2) as u8;
-
-        let winner_pubkey = if flip_result == game.player_one_side {
-            game.player_one
-        } else {
-            game.player_two
-        };
-
-        // 3. Automated Payout with 0.1% Commission
-        game.status = 2; // Finished
-        let total_pool = game.amount * 2;
-        
-        // Calculate 0.1% (total_pool / 1000)
-        let commission_amount = total_pool / 1000;
-        let winner_prize = total_pool - commission_amount;
-
-        let winner_info = if winner_pubkey == game.player_one {
-            ctx.accounts.player_one.to_account_info()
-        } else {
-            ctx.accounts.player_two.to_account_info()
-        };
-
-        // Deduct total from game account
-        **game.to_account_info().try_borrow_mut_lamports()? -= total_pool;
-        
-        // Transfer to winner
-        **winner_info.try_borrow_mut_lamports()? += winner_prize;
-        
-        // Transfer to commission account
-        **ctx.accounts.commission_account.try_borrow_mut_lamports()? += commission_amount;
-
-        // 4. Emit the result
-        emit!(FlipFinished {
-            game_id: game.game_id,
-            winner: winner_pubkey,
-            player_one: game.player_one,
-            player_two: game.player_two,
-            amount: winner_prize, // Log the actual amount won
-            side_won: flip_result,
-        });
-
-        Ok(())
-    }
-}
-
-#[derive(Accounts)]
-#[instruction(game_id: u64, amount: u64)]
-pub struct CreateGame<'info> {
-    #[account(
-        init, payer = player_one,
-        space = 8 + 32 + 32 + 8 + 1 + 8 + 1,
-        seeds = [b"game", player_one.key().as_ref(), &game_id.to_le_bytes()],
-        bump
-    )]
-    pub game: Account<'info, Game>,
-    #[account(mut)]
-    pub player_one: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct JoinAndFlip<'info> {
-    #[account(
-        mut, 
-        seeds = [b"game", player_one.key().as_ref(), &game.game_id.to_le_bytes()], 
-        bump
-    )]
-    pub game: Account<'info, Game>,
-    #[account(mut)]
-    pub player_one: AccountInfo<'info>,
-    #[account(mut)]
-    pub player_two: Signer<'info>,
-    /// CHECK: This is the hardcoded commission address
-    #[account(mut, address = COMMISSION_ADDRESS)]
-    pub commission_account: AccountInfo<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[account]
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct Game {
     pub player_one: Pubkey,
     pub player_two: Pubkey,
     pub amount: u64,
     pub player_one_side: u8,
     pub game_id: u64,
-    pub status: u8,
+    pub status: u8, // 1 = Open, 2 = Finished
 }
 
-#[event]
-pub struct GameCreated {
-    pub game_id: u64,
-    pub player_one: Pubkey,
-    pub amount: u64,
+// --- 2. INSTRUCTIONS ---
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub enum CoinflipInstruction {
+    CreateGame { game_id: u64, amount: u64, side: u8 },
+    JoinAndFlip,
+    CancelGame,
 }
 
-#[event]
-pub struct FlipFinished {
-    pub game_id: u64,
-    pub winner: Pubkey,
-    pub player_one: Pubkey,
-    pub player_two: Pubkey,
-    pub amount: u64,
-    pub side_won: u8,
+// --- 3. ENTRYPOINT ---
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let instruction = CoinflipInstruction::try_from_slice(instruction_data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    match instruction {
+        CoinflipInstruction::CreateGame {
+            game_id,
+            amount,
+            side,
+        } => process_create_game(program_id, accounts, game_id, amount, side),
+        CoinflipInstruction::JoinAndFlip => process_join_and_flip(program_id, accounts),
+        CoinflipInstruction::CancelGame => process_cancel_game(program_id, accounts),
+    }
 }
 
-#[error_code]
-pub enum CoinflipError {
-    #[msg("Already finished")]
-    GameAlreadyFinished,
+// --- 4. PROCESSORS ---
+
+fn process_create_game(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    game_id: u64,
+    amount: u64,
+    side: u8,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let game_pda = next_account_info(account_info_iter)?;
+    let player_one = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+
+    if !player_one.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Shield: Prevent Re-initialization
+    if !game_pda.data_is_empty() {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    let (expected_pda, bump) = Pubkey::find_program_address(
+        &[b"game", player_one.key.as_ref(), &game_id.to_le_bytes()],
+        program_id,
+    );
+    if expected_pda != *game_pda.key {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let space = 82;
+    let rent = Rent::get()?;
+    let rent_lamports = rent.minimum_balance(space);
+
+    invoke_signed(
+        &system_instruction::create_account(
+            player_one.key,
+            game_pda.key,
+            rent_lamports,
+            space as u64,
+            program_id,
+        ),
+        &[player_one.clone(), game_pda.clone(), system_program.clone()],
+        &[&[
+            b"game",
+            player_one.key.as_ref(),
+            &game_id.to_le_bytes(),
+            &[bump],
+        ]],
+    )?;
+
+    let game_state = Game {
+        player_one: *player_one.key,
+        player_two: Pubkey::default(),
+        amount,
+        player_one_side: side,
+        game_id,
+        status: 1,
+    };
+    game_state.serialize(&mut &mut game_pda.data.borrow_mut()[..])?;
+
+    invoke(
+        &system_instruction::transfer(player_one.key, game_pda.key, amount),
+        &[player_one.clone(), game_pda.clone()],
+    )?;
+
+    Ok(())
+}
+
+fn process_join_and_flip(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+
+    let game_pda = next_account_info(account_info_iter)?;
+    let player_one_info = next_account_info(account_info_iter)?;
+    let player_two = next_account_info(account_info_iter)?;
+    let commission_acc = next_account_info(account_info_iter)?;
+    let slot_hashes_info = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+
+    if !player_two.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *commission_acc.key != COMMISSION_ADDRESS {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let mut game_data = Game::try_from_slice(&game_pda.data.borrow())?;
+
+    if game_data.status != 1 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if game_data.player_one != *player_one_info.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if game_data.player_one == *player_two.key {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    invoke(
+        &system_instruction::transfer(player_two.key, game_pda.key, game_data.amount),
+        &[player_two.clone(), game_pda.clone(), system_program.clone()],
+    )?;
+
+    // Randomness (SlotHashes)
+    let data = slot_hashes_info.data.borrow();
+    let most_recent_hash_byte = data[12];
+    let flip_result = (most_recent_hash_byte % 2) as u8;
+
+    // Financials - Replacing ArithmeticOverflow with InvalidAccountData
+    let total_pool = game_data
+        .amount
+        .checked_mul(2)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let commission = total_pool
+        .checked_div(100)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let winner_prize = total_pool
+        .checked_sub(commission)
+        .ok_or(ProgramError::InvalidAccountData)?;
+
+    let is_p1_winner = flip_result == game_data.player_one_side;
+
+    // Safe Payouts
+    **game_pda.try_borrow_mut_lamports()? = game_pda
+        .lamports()
+        .checked_sub(total_pool)
+        .ok_or(ProgramError::InsufficientFunds)?;
+
+    if is_p1_winner {
+        **player_one_info.try_borrow_mut_lamports()? = player_one_info
+            .lamports()
+            .checked_add(winner_prize)
+            .ok_or(ProgramError::InvalidAccountData)?;
+    } else {
+        **player_two.try_borrow_mut_lamports()? = player_two
+            .lamports()
+            .checked_add(winner_prize)
+            .ok_or(ProgramError::InvalidAccountData)?;
+    }
+
+    **commission_acc.try_borrow_mut_lamports()? = commission_acc
+        .lamports()
+        .checked_add(commission)
+        .ok_or(ProgramError::InvalidAccountData)?;
+
+    game_data.player_two = *player_two.key;
+    game_data.status = 2;
+    game_data.serialize(&mut &mut game_pda.data.borrow_mut()[..])?;
+
+    Ok(())
+}
+
+fn process_cancel_game(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let game_pda = next_account_info(account_info_iter)?;
+    let player_one = next_account_info(account_info_iter)?;
+
+    if !player_one.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let game_data = Game::try_from_slice(&game_pda.data.borrow())?;
+
+    if game_data.player_one != *player_one.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if game_data.status != 1 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let total_refund = game_pda.lamports();
+
+    **player_one.try_borrow_mut_lamports()? = player_one
+        .lamports()
+        .checked_add(total_refund)
+        .ok_or(ProgramError::InvalidAccountData)?;
+
+    **game_pda.try_borrow_mut_lamports()? = 0;
+
+    let mut data = game_pda.data.borrow_mut();
+    data.fill(0);
+
+    Ok(())
 }
