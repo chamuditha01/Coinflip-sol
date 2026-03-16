@@ -6,7 +6,313 @@ body {
   font-family: 'Outfit', sans-serif;
   color: #e0d5ff;
 }
+:root {
+    --crypto-bg: #0c0f14;
+    --crypto-panel: #141a21;
+    --crypto-border: #242d38;
+    --crypto-accent: #14F195; /* Solana Green */
+    --crypto-text: #8a939f;
+}
 
+.crypto-verify-container {
+    display: flex;
+    height: 100vh;
+    background: var(--crypto-bg);
+    font-family: 'Inter', 'Roboto Mono', monospace;
+}
+
+/* Editor Section */
+.editor-pane {
+    flex: 1.2;
+    background: var(--crypto-panel);
+    border-right: 1px solid var(--crypto-border);
+    display: flex;
+    flex-direction: column;
+}
+
+.editor-tabs {
+    display: flex;
+    background: #090c10;
+    padding: 0 10px;
+}
+
+.editor-tabs button {
+    background: transparent;
+    border: none;
+    color: var(--crypto-text);
+    padding: 12px 18px;
+    font-size: 11px;
+    letter-spacing: 1px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+}
+
+.editor-tabs button.active {
+    color: var(--crypto-accent);
+    border-bottom: 2px solid var(--crypto-accent);
+    background: rgba(20, 241, 149, 0.03);
+}
+
+.editor-content {
+    padding: 20px;
+    overflow-y: auto;
+    text-align: left;
+    color: #c9d1d9;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Preview Section */
+.preview-pane {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+}
+
+.glass-card {
+    width: 100%;
+    max-width: 480px;
+    background: rgba(20, 26, 33, 0.8);
+    border: 1px solid var(--crypto-border);
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--crypto-text);
+    margin-bottom: 25px;
+    text-transform: uppercase;
+}
+
+.status-dot {
+    width: 6px;
+    height: 6px;
+    background: var(--crypto-accent);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--crypto-accent);
+}
+
+.input-box {
+    margin-bottom: 18px;
+    text-align: left;
+}
+
+.input-box label {
+    display: block;
+    font-size: 10px;
+    color: var(--crypto-text);
+    margin-bottom: 6px;
+}
+
+.input-box input {
+    width: 100%;
+    background: #090c10;
+    border: 1px solid var(--crypto-border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    color: #fff;
+    outline: none;
+}
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+
+.verify-action-btn {
+    width: 100%;
+    padding: 12px;
+    background: var(--crypto-accent);
+    border: none;
+    border-radius: 6px;
+    color: #000;
+    font-weight: 700;
+    cursor: pointer;
+    margin-top: 10px;
+    transition: 0.2s;
+}
+
+.verify-action-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(20, 241, 149, 0.3);
+}
+
+.result-display {
+    margin-top: 25px;
+    padding: 15px;
+    border-radius: 8px;
+    border: 1px solid var(--crypto-border);
+}
+
+.result-display.valid { border-left: 4px solid var(--crypto-accent); }
+.result-display.invalid { border-left: 4px solid #ff4b4b; }
+
+.res-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-bottom: 5px;
+}
+
+.neon-text { color: var(--crypto-accent); }
+.v-split-container {
+    display: flex;
+    height: 100vh;
+    background: #0c0f14;
+    color: #8a939f;
+    font-family: 'Inter', sans-serif;
+}
+
+/* Editor Section */
+.v-editor {
+    flex: 1;
+    background: #090c10;
+    border-right: 1px solid #242d38;
+    display: flex;
+    flex-direction: column;
+}
+
+.v-tabs {
+    display: flex;
+    background: #111;
+    border-bottom: 1px solid #242d38;
+}
+
+.v-tabs button {
+    background: transparent;
+    border: none;
+    color: #555;
+    padding: 12px 20px;
+    font-size: 11px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.v-tabs button.active {
+    color: #14F195;
+    border-bottom: 2px solid #14F195;
+    background: rgba(20, 241, 149, 0.05);
+}
+
+.v-code {
+    padding: 20px;
+    text-align: left;
+    font-family: 'Roboto Mono', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    overflow: auto;
+}
+
+/* Preview Section */
+.v-preview {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.glass-card {
+    width: 100%;
+    max-width: 500px;
+    background: #141a21;
+    border: 1px solid #242d38;
+    border-radius: 12px;
+    padding: 30px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #8a939f;
+    margin-bottom: 30px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    background: #14F195;
+    border-radius: 50%;
+    box-shadow: 0 0 10px #14F195;
+}
+
+.v-input-box {
+    margin-bottom: 20px;
+    text-align: left;
+}
+
+.v-input-box label {
+    display: block;
+    font-size: 11px;
+    color: #5b6672;
+    margin-bottom: 8px;
+    font-weight: 600;
+}
+
+.v-input-box input {
+    width: 100%;
+    background: #090c11;
+    border: 1px solid #1c232d;
+    border-radius: 8px;
+    padding: 14px 16px;
+    color: #fff;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.v-grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 15px;
+}
+
+.v-execute-btn {
+    width: 100%;
+    background: #14F195;
+    color: #000;
+    border: none;
+    border-radius: 8px;
+    padding: 16px;
+    font-weight: 800;
+    font-size: 14px;
+    cursor: pointer;
+    margin-top: 10px;
+    transition: 0.2s ease;
+    text-transform: uppercase;
+}
+
+.v-execute-btn:hover {
+    filter: brightness(1.1);
+    box-shadow: 0 0 20px rgba(20, 241, 149, 0.2);
+}
+
+.v-result-box {
+    margin-top: 25px;
+    padding: 15px;
+    border-radius: 8px;
+    background: rgba(0,0,0,0.2);
+    border: 1px solid #242d38;
+}
+
+.v-success { border-left: 4px solid #14F195; }
+.v-fail { border-left: 4px solid #ff4b4b; }
+
+.v-res-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-bottom: 6px;
+}
+
+.v-neon-txt { color: #14F195; text-shadow: 0 0 5px #14F195; }
 .gem-card {
   background: rgba(255, 255, 255, 0.03);
   backdrop-filter: blur(12px);

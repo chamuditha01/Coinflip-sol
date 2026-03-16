@@ -55,6 +55,108 @@ function CoinflipUI() {
     const [resultModal, setResultModal] = useState(null); 
     const [flippedResult, setFlippedResult] = useState(null); 
     const navigate = useNavigate();
+    const [gameHistory, setGameHistory] = useState([]);
+    const [selectedHistory, setSelectedHistory] = useState(null);
+// Add this line with your other state declarations
+const historyScrollRef = useRef(null);
+
+
+// Helper to parse the Rust log format: [1, 2, 3...] into Hex
+const parseLogArray = (str) => {
+    if (!str) return "N/A";
+    const bytes = str.replace(/[\[\]]/g, '').split(',').map(Number);
+    return Buffer.from(bytes).toString('hex');
+};
+
+
+useEffect(() => {
+    if (!connection || !publicKey) return;
+
+    // Lobby Listener
+    const lobbySub = connection.onProgramAccountChange(
+        PROGRAM_ID,
+        () => fetchGames(),
+        'confirmed'
+    );
+
+    let gameSub = null;
+    if (activePdaRef.current && flipping) {
+        gameSub = connection.onAccountChange(
+            activePdaRef.current,
+            (accountInfo) => {
+                try {
+                    const data = borsh.deserialize(gameSchema, GameAccount, accountInfo.data);
+                    if (data.status === 2) {
+                        setSystemMsg("OPPONENT_FOUND! FLIPPING...");
+                    }
+                } catch (e) {
+                    // This block runs when the account is closed (Settled on-chain)
+                    handleSettlement();
+                    
+                    // --- AUTO UPDATE HISTORY HERE ---
+                    // Since the backend just finished, we fetch the new logs
+                    setTimeout(() => fetchHistory(), 2000); 
+                }
+            },
+            'confirmed'
+        );
+    }
+
+    return () => {
+        connection.removeAccountChangeListener(lobbySub);
+        if (gameSub) connection.removeAccountChangeListener(gameSub);
+    };
+}, [connection, publicKey, flipping]);
+
+
+const fetchHistory = async () => {
+    try {
+        // 1. Get transaction signatures involving your Program ID
+        const signatures = await connection.getSignaturesForAddress(PROGRAM_ID, { limit: 10 });
+        const parsedHistory = [];
+
+        for (let sig of signatures) {
+            // 2. Fetch the detailed transaction info
+            const tx = await connection.getParsedTransaction(sig.signature, {
+                maxSupportedTransactionVersion: 0,
+            });
+
+            if (tx && tx.meta && tx.meta.logMessages) {
+                // 3. Find the specific "FLIP_RESULT" log we created in Rust
+                const resultLog = tx.meta.logMessages.find(log => log.includes("FLIP_RESULT"));
+                
+                if (resultLog) {
+                    // Extract data using Regex
+                    const gameId = resultLog.match(/game_id=(\d+)/)?.[1];
+                    const seedA = resultLog.match(/seed_a=\[(.*?)\]/)?.[1];
+                    const seedB = resultLog.match(/seed_b=\[(.*?)\]/)?.[1];
+                    const sSeed = resultLog.match(/server_seed=\[(.*?)\]/)?.[1];
+                    const sHash = resultLog.match(/server_hash=\[(.*?)\]/)?.[1];
+                    const winner = resultLog.match(/winner_side=(\d+)/)?.[1];
+
+                    parsedHistory.push({
+                        gameId,
+                        seedA: parseLogArray(seedA),
+                        seedB: parseLogArray(seedB),
+                        serverSeed: parseLogArray(sSeed),
+                        serverHash: parseLogArray(sHash),
+                        winner: winner === "0" ? "HEADS" : "TAILS",
+                        sig: sig.signature,
+                        time: new Date(sig.blockTime * 1000).toLocaleTimeString()
+                    });
+                }
+            }
+        }
+        setGameHistory(parsedHistory);
+    } catch (e) {
+        console.error("History fetch error:", e);
+    }
+};
+
+// Call this in a useEffect or after a game settles
+useEffect(() => {
+    if (publicKey) fetchHistory();
+}, [publicKey]);
     
     const balanceBeforeFlip = useRef(0);
     const activePdaRef = useRef(null);
@@ -189,6 +291,12 @@ function CoinflipUI() {
         } 
     };
 
+    const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text);
+    // Optional: Add a toast notification or simple alert here
+   // alert("Seed copied to clipboard!"); 
+};
+
     const joinGame = async (game) => {
         if (!publicKey) return;
         const mySide = game.player_one_side === 0 ? 1 : 0;
@@ -274,6 +382,153 @@ function CoinflipUI() {
                     </div>
                     
                 </div>
+{/* --- POPUP MODAL FOR HISTORY DETAILS --- */}
+{selectedHistory && (
+    <div 
+        className="result-overlay" 
+        style={{ 
+            position: 'fixed', // Pins to the window, not the container
+            top: 0, 
+            left: 0, 
+            width: '100vw', 
+            height: '100vh', 
+            zIndex: 9999,      // Ensures it is above everything
+            backgroundColor: 'rgba(0, 0, 0, 0.85)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backdropFilter: 'blur(4px)'
+        }}
+        onClick={() => setSelectedHistory(null)} // Close when clicking outside
+    >
+        <div 
+            className="glass-panel" 
+            style={{ 
+                width: '100%',
+                maxWidth: '480px', 
+                padding: '30px', 
+                border: '1px solid #242d38',
+                background: '#141a21',
+                boxShadow: '0 20px 50px rgba(0,0,0,0.5)'
+            }}
+            onClick={(e) => e.stopPropagation()} // Prevents closing when clicking inside
+        >
+            <div className="card-header" style={{ marginBottom: '25px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div className="status-dot"></div>
+                <span style={{ fontSize: '12px', color: '#8a939f', fontWeight: 'bold' }}>⚖️ PROVABLY FAIR VERIFICATION</span>
+            </div>
+
+            <div className="v-input-box">
+                <label>ROUND ID (GAME ID)</label>
+                <div className="copy-box" onClick={() => copyToClipboard(selectedHistory.gameId)}>
+                    <input readOnly value={selectedHistory.gameId} className="modal-input" />
+                </div>
+            </div>
+
+            <div className="v-input-box">
+                <label>PRIVATE HASH (SERVER COMMIT)</label>
+                <div className="copy-box" onClick={() => copyToClipboard(selectedHistory.serverHash)}>
+                    <input readOnly value={selectedHistory.serverHash} className="modal-input" />
+                </div>
+            </div>
+
+            <div className="v-input-box">
+                <label>PRIVATE SEED (SERVER REVEAL)</label>
+                <div className="copy-box" onClick={() => copyToClipboard(selectedHistory.serverSeed)}>
+                    <input readOnly value={selectedHistory.serverSeed} className="modal-input" />
+                </div>
+            </div>
+
+            <div className="v-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px' }}>
+                <div className="v-input-box">
+                    <label>PUBLIC SEED A</label>
+                    <input readOnly value={selectedHistory.seedA} className="modal-input" />
+                </div>
+                <div className="v-input-box">
+                    <label>PUBLIC SEED B</label>
+                    <input readOnly value={selectedHistory.seedB} className="modal-input" />
+                </div>
+            </div>
+
+            <div className="v-input-box" style={{ marginTop: '10px' }}>
+                <label>OUTCOME</label>
+                <div style={{ 
+                    padding: '14px', 
+                    background: '#090c11', 
+                    borderRadius: '8px', 
+                    textAlign: 'center',
+                    fontWeight: 'bold',
+                    fontSize: '16px',
+                    color: selectedHistory.winner === 'HEADS' ? '#14F195' : '#9945FF',
+                    border: `1px solid ${selectedHistory.winner === 'HEADS' ? '#14F19533' : '#9945FF33'}`
+                }}>
+                    {selectedHistory.winner}
+                </div>
+            </div>
+
+            <button 
+                className="btn-primary" 
+                style={{ 
+                    width: '100%', 
+                    marginTop: '25px', 
+                    padding: '16px',
+                    background: '#9945FF', // Matching your purple button
+                    boxShadow: '0 0 15px rgba(153, 69, 255, 0.4)'
+                }} 
+                onClick={() => setSelectedHistory(null)}
+            >
+                CLOSE
+            </button>
+        </div>
+    </div>
+)}
+
+
+
+    <div 
+    className="history-bar-container" 
+    ref={historyScrollRef}
+    style={{ 
+        display: 'flex', 
+        flexDirection: 'row',         // Standard flow
+        justifyContent: 'flex-end',   // Pushes all content to the right side
+        alignItems: 'center',
+        gap: '8px', 
+        padding: '10px', 
+        background: 'rgba(0,0,0,0.3)', 
+        borderRadius: '10px',
+        overflowX: 'auto',
+        minHeight: '40px',
+        width: '100%',                // Ensure container spans full width
+        boxSizing: 'border-box'
+    }}
+>
+    {/* We slice().reverse() so index 0 (newest) appears at the end of the row (right) */}
+    {[...gameHistory].reverse().map((h, i) => {
+        // Since we reversed, the newest game is now the last index in the map
+        const isNewest = i === gameHistory.length - 1; 
+
+        return (
+            <div 
+                key={i} 
+                className="history-pill"
+                onClick={() => setSelectedHistory(h)}
+                style={{
+                    height: '24px',
+                    width: '12px',
+                    borderRadius: '10px',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s ease',
+                    flexShrink: 0,
+                    backgroundColor: h.winner === 'HEADS' ? '#14F195' : '#9945FF',
+                    boxShadow: isNewest ? `0 0 12px ${h.winner === 'HEADS' ? '#14F195' : '#9945FF'}` : 'none',
+                    border: isNewest ? '1px solid white' : 'none',
+                    opacity: isNewest ? 1 : 0.7
+                }}
+            />
+        );
+    })}
+</div>
 
                 <div className="coin-container">
                     <div className={`coin ${flipping ? 'flipping' : ''}`}>
@@ -322,6 +577,8 @@ function CoinflipUI() {
                     ))}
                     {openGames.length === 0 && <p className="no-lobbies">No active lobbies found...</p>}
                 </div>
+
+                
             </div>
         </div>
     );

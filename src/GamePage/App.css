@@ -7,6 +7,93 @@ body {
   color: #e0d5ff;
 }
 
+.history-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+}
+.history-table th {
+    color: #666;
+    text-align: left;
+    padding: 10px;
+    border-bottom: 1px solid #333;
+}
+.history-table td {
+    padding: 10px;
+    border-bottom: 1px solid #222;
+}
+.history-table tr:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.history-bar-container::-webkit-scrollbar {
+    height: 4px;
+}
+
+.history-bar-container::-webkit-scrollbar-thumb {
+    background: #242d38;
+    border-radius: 10px;
+}
+
+/* For the Details Modal Labels */
+.v-input-box label {
+    display: block;
+    font-size: 10px;
+    color: #8a939f;
+    margin-bottom: 5px;
+    font-weight: bold;
+    text-transform: uppercase;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    background: #14F195;
+    border-radius: 50%;
+    box-shadow: 0 0 10px #14F195;
+}
+
+/* Reusing your existing copy-box styles but making it fit the modal */
+.copy-box {
+    cursor: pointer;
+    background: #090c11;
+    border-radius: 4px;
+    padding: 5px;
+    transition: background 0.2s;
+}
+
+.copy-box:hover {
+    background: #1c232d;
+}
+
+
+.history-bar-container {
+    scrollbar-width: thin;
+    scrollbar-color: #242d38 transparent;
+}
+
+.history-bar-container::-webkit-scrollbar {
+    height: 3px;
+}
+
+.history-bar-container::-webkit-scrollbar-thumb {
+    background: #512da8;
+    border-radius: 10px;
+}
+
+/* Optional: Pulse animation for the latest flip */
+.history-pill:first-child {
+    animation: pulseGlow 2s infinite;
+}
+
+@keyframes pulseGlow {
+    0% { filter: brightness(1); }
+    50% { filter: brightness(1.4); }
+    100% { filter: brightness(1); }
+}
+
+
 .gem-card {
   background: rgba(255, 255, 255, 0.03);
   backdrop-filter: blur(12px);
