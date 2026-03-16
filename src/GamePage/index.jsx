@@ -1,0 +1,339 @@
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import * as web3 from '@solana/web3.js';
+import * as borsh from 'borsh';
+import { Buffer } from 'buffer';
+import './App.css';
+import { useNavigate } from 'react-router-dom';
+
+// Solana Wallet Adapter
+import { ConnectionProvider, WalletProvider, useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { PhantomWalletAdapter } from '@solana/wallet-adapter-wallets';
+import { WalletModalProvider, WalletMultiButton } from '@solana/wallet-adapter-react-ui';
+
+require('@solana/wallet-adapter-react-ui/styles.css');
+window.Buffer = Buffer;
+
+const PROGRAM_ID = new web3.PublicKey("7B7qKQtG16Gf3qiYY5R5P1ym1AMm6dqffJbbYuyptZwk");
+const COMMISSION_ADDRESS = new web3.PublicKey("3FSdF5cDCjkEsrcLEeCDkNBkLLHtpbSiqpxTbcENnydJ");
+const HELIUS_RPC = "https://devnet.helius-rpc.com/?api-key=3d1eb615-02f9-4796-ac88-be5f07f93ba5";
+
+class GameAccount {
+    constructor(fields) {
+        this.player_one = new web3.PublicKey(fields.player_one);
+        this.player_two = new web3.PublicKey(fields.player_two);
+        this.amount = fields.amount;
+        this.player_one_side = fields.player_one_side;
+        this.game_id = fields.game_id;
+        this.status = fields.status;
+        this.server_hash = fields.server_hash;
+        this.client_seed_a = fields.client_seed_a;
+        this.client_seed_b = fields.client_seed_b;
+    }
+}
+
+const gameSchema = new Map([[GameAccount, {
+    kind: 'struct',
+    fields: [
+        ['player_one', [32]], ['player_two', [32]], ['amount', 'u64'],
+        ['player_one_side', 'u8'], ['game_id', 'u64'], ['status', 'u8'],
+        ['server_hash', [32]], ['client_seed_a', [32]], ['client_seed_b', [32]],
+        ['padding', [2]], 
+    ]
+}]]);
+
+function CoinflipUI() {
+    const { connection } = useConnection();
+    const { publicKey, sendTransaction } = useWallet();
+    
+    const [wager, setWager] = useState("0.1");
+    const [selectedSide, setSelectedSide] = useState(0); 
+    const [openGames, setOpenGames] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [flipping, setFlipping] = useState(false);
+    const [systemMsg, setSystemMsg] = useState("LOBBY_READY");
+    const [balance, setBalance] = useState(0);
+    const [resultModal, setResultModal] = useState(null); 
+    const [flippedResult, setFlippedResult] = useState(null); 
+    const navigate = useNavigate();
+    
+    const balanceBeforeFlip = useRef(0);
+    const activePdaRef = useRef(null);
+
+    const fetchBalance = async () => {
+        if (!publicKey) return;
+        const bal = await connection.getBalance(publicKey);
+        setBalance(bal / web3.LAMPORTS_PER_SOL);
+    };
+
+    const fetchGames = async () => {
+        try {
+            const accounts = await connection.getProgramAccounts(PROGRAM_ID);
+            const all = accounts.map(({ pubkey, account }) => {
+                try { 
+                    const decoded = borsh.deserialize(gameSchema, GameAccount, account.data);
+                    return { pubkey, ...decoded }; 
+                } catch (e) { return null; }
+            }).filter(g => g !== null);
+
+            setOpenGames(all.filter(g => g.status === 1));
+        } catch (e) { console.error("Fetch Error:", e); }
+    };
+
+    const handleSettlement = async () => {
+        setSystemMsg("VERIFYING_OUTCOME...");
+        setTimeout(async () => {
+            const currentBalRaw = await connection.getBalance(publicKey);
+            const currentBal = currentBalRaw / web3.LAMPORTS_PER_SOL;
+            
+            let won = currentBal > balanceBeforeFlip.current;
+            const result = won ? selectedSide : (selectedSide === 0 ? 1 : 0);
+            
+            setFlippedResult(result);
+            setResultModal(won ? 'WON' : 'LOST');
+            setSystemMsg(won ? "LOBBY_SETTLED: WINNER" : "LOBBY_SETTLED: LOSER");
+            
+            setBalance(currentBal);
+            setFlipping(false);
+            setLoading(false);
+            activePdaRef.current = null;
+        }, 4000);
+    };
+
+    useEffect(() => {
+        if (!connection || !publicKey) return;
+
+        const lobbySub = connection.onProgramAccountChange(
+            PROGRAM_ID,
+            () => fetchGames(),
+            'confirmed'
+        );
+
+        let gameSub = null;
+        if (activePdaRef.current && flipping) {
+            gameSub = connection.onAccountChange(
+                activePdaRef.current,
+                (accountInfo) => {
+                    try {
+                        const data = borsh.deserialize(gameSchema, GameAccount, accountInfo.data);
+                        if (data.status === 2) {
+                            setSystemMsg("OPPONENT_FOUND! FLIPPING...");
+                        }
+                    } catch (e) {
+                        handleSettlement();
+                    }
+                },
+                'confirmed'
+            );
+        }
+
+        return () => {
+            connection.removeAccountChangeListener(lobbySub);
+            if (gameSub) connection.removeAccountChangeListener(gameSub);
+        };
+    }, [connection, publicKey, flipping]);
+
+    useEffect(() => {
+        fetchGames();
+        fetchBalance();
+    }, [publicKey]);
+
+    const createGame = async () => {
+        if (!publicKey) return;
+        setLoading(true);
+        setSystemMsg("INITIALIZING_HANDSHAKE...");
+        try {
+            const gameId = Math.floor(Date.now() / 1000);
+            const response = await fetch('http://localhost:3001/generate-game', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ gameId })
+            });
+            const { serverHash } = await response.json();
+            const clientSeedA = Array.from(window.crypto.getRandomValues(new Uint8Array(32)));
+            
+            const idBuffer = Buffer.alloc(8);
+            idBuffer.writeBigUInt64LE(BigInt(gameId));
+            const [pda] = await web3.PublicKey.findProgramAddress(
+                [Buffer.from("game"), publicKey.toBuffer(), idBuffer], 
+                PROGRAM_ID
+            );
+
+            const data = Buffer.alloc(1 + 8 + 8 + 1 + 32 + 32);
+            let offset = 0;
+            data.writeUInt8(0, offset); offset += 1;
+            data.writeBigUInt64LE(BigInt(gameId), offset); offset += 8;
+            data.writeBigUInt64LE(BigInt(Math.floor(parseFloat(wager) * web3.LAMPORTS_PER_SOL)), offset); offset += 8;
+            data.writeUInt8(selectedSide, offset); offset += 1;
+            Buffer.from(serverHash).copy(data, offset); offset += 32;
+            Buffer.from(clientSeedA).copy(data, offset); offset += 32;
+
+            const tx = new web3.Transaction().add(new web3.TransactionInstruction({
+                keys: [
+                    { pubkey: pda, isSigner: false, isWritable: true }, 
+                    { pubkey: publicKey, isSigner: true, isWritable: true }, 
+                    { pubkey: web3.SystemProgram.programId, isSigner: false, isWritable: false }
+                ],
+                programId: PROGRAM_ID, data,
+            }));
+
+            await sendTransaction(tx, connection);
+            
+            balanceBeforeFlip.current = balance; 
+            activePdaRef.current = pda;
+            setFlipping(true);
+            setSystemMsg("LOBBY_OPEN: WAITING_FOR_OPPONENT");
+            fetchGames();
+        } catch (e) { 
+            setSystemMsg("ERR: " + e.message); 
+            setLoading(false); 
+        } 
+    };
+
+    const joinGame = async (game) => {
+        if (!publicKey) return;
+        const mySide = game.player_one_side === 0 ? 1 : 0;
+        setSelectedSide(mySide);
+
+        setLoading(true);
+        setSystemMsg("JOINING_MATCH...");
+        
+        try {
+            balanceBeforeFlip.current = balance;
+            const clientSeedB = Array.from(window.crypto.getRandomValues(new Uint8Array(32)));
+            const data = Buffer.alloc(1 + 32);
+            data.writeUInt8(1, 0); 
+            Buffer.from(clientSeedB).copy(data, 1);
+
+            const tx = new web3.Transaction().add(new web3.TransactionInstruction({
+                keys: [
+                    { pubkey: game.pubkey, isSigner: false, isWritable: true },
+                    { pubkey: publicKey, isSigner: true, isWritable: true },
+                    { pubkey: game.player_one, isSigner: false, isWritable: true },
+                    { pubkey: COMMISSION_ADDRESS, isSigner: false, isWritable: true },
+                    { pubkey: web3.SystemProgram.programId, isSigner: false, isWritable: false },
+                ],
+                programId: PROGRAM_ID, data,
+            }));
+
+            const signature = await sendTransaction(tx, connection);
+            setSystemMsg("CONFIRMING...");
+            await connection.confirmTransaction(signature, 'confirmed');
+            
+            activePdaRef.current = game.pubkey;
+            setFlipping(true);
+            setSystemMsg("MATCH_LIVE: FLIPPING...");
+        } catch (e) { 
+            setLoading(false);
+            setSystemMsg("ERR: " + e.message); 
+        }
+    };
+
+    return (
+        <div className="app-container">
+            {resultModal && (
+                <div className="result-overlay">
+                    <div className={`result-card ${resultModal === 'WON' ? 'glow-green' : 'glow-red'}`}>
+                        <div className="result-coin-icon">
+                            {flippedResult === 0 ? 'H' : 'T'}
+                        </div>
+                        <h2>{flippedResult === 0 ? 'HEADS' : 'TAILS'}</h2>
+                        <h3 style={{ marginTop: '10px' }}>{resultModal === 'WON' ? '🏆 YOU WON!' : '💀 YOU LOST'}</h3>
+                        <p>{resultModal === 'WON' ? 'SOL transferred to your wallet.' : 'The pot was taken by the opponent.'}</p>
+                        <button className="btn-primary" style={{marginTop: '20px'}} onClick={() => {
+                            setResultModal(null);
+                            setFlippedResult(null);
+                        }}>BACK TO LOBBY</button>
+                    </div>
+                </div>
+            )}
+
+            <div style={{ padding: '40px', maxWidth: '1000px', margin: '0 auto' }}>
+                <div className="header-row">
+                    <h1 className="logo-text">SOL_FLIP_v2</h1>
+                    <div className="wallet-info">
+                        <div className="glass-panel balance-box">⚡ {balance.toFixed(3)} SOL</div>
+                        <WalletMultiButton />
+                        <div className="glass-panel balance-box">
+                        <button 
+      onClick={() => navigate('/verify')} // Change this path to your target route
+      style={{
+        padding: '10px 20px',
+        backgroundColor: '#512da8', // Standard Solana purple
+        color: 'white',
+        border: 'none',
+        borderRadius: '8px',
+        width: '100%',
+        height:'100%',
+        cursor: 'pointer',
+        fontWeight: 'bold',
+        marginTop:'10px'
+      }}
+    >
+      Verify Game
+    </button></div>
+                    </div>
+                    
+                </div>
+
+                <div className="coin-container">
+                    <div className={`coin ${flipping ? 'flipping' : ''}`}>
+                        <div className="coin-front">H</div>
+                        <div className="coin-back">T</div>
+                    </div>
+                </div>
+
+                <div className="glass-panel main-controls">
+                    <p className="status-msg">{'>'} {systemMsg}</p>
+                    <div className="input-group">
+                        <input type="number" value={wager} onChange={e => setWager(e.target.value)} className="wager-input" disabled={flipping} />
+                        
+                        <div className="side-toggle">
+                            <button 
+                                onClick={() => setSelectedSide(0)} 
+                                className={`side-btn ${selectedSide === 0 ? 'active' : ''}`}
+                            >
+                                HEADS
+                            </button>
+                            <button 
+                                onClick={() => setSelectedSide(1)} 
+                                className={`side-btn ${selectedSide === 1 ? 'active' : ''}`}
+                            >
+                                TAILS
+                            </button>
+                        </div>
+
+                        <button className="btn-primary create-btn" onClick={createGame} disabled={loading || flipping}>
+                            {loading && !flipping ? "SIGNING..." : "CREATE LOBBY"}
+                        </button>
+                    </div>
+                </div>
+
+                <h2 className="section-title">ACTIVE_LOBBIES</h2>
+                <div className="lobby-grid">
+                    {openGames.map(g => (
+                        <div key={g.pubkey.toBase58()} className="glass-panel lobby-card">
+                            <p className="lobby-amount">{Number(g.amount)/1e9} SOL</p>
+                            <p className="lobby-creator">BY: {g.player_one.toBase58().slice(0,8)}...</p>
+                            <p className="lobby-side">CREATOR PICKED: {g.player_one_side === 0 ? "HEADS" : "TAILS"}</p>
+                            <button className="btn-primary join-btn" onClick={() => joinGame(g)} disabled={loading || flipping}>
+                                {publicKey && g.player_one.equals(publicKey) ? "YOUR LOBBY" : "JOIN & FLIP"}
+                            </button>
+                        </div>
+                    ))}
+                    {openGames.length === 0 && <p className="no-lobbies">No active lobbies found...</p>}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+export default function App() {
+    const wallets = useMemo(() => [new PhantomWalletAdapter()], []);
+    return (
+        <ConnectionProvider endpoint={HELIUS_RPC}>
+            <WalletProvider wallets={wallets} autoConnect>
+                <WalletModalProvider><CoinflipUI /></WalletModalProvider>
+            </WalletProvider>
+        </ConnectionProvider>
+    );
+}
