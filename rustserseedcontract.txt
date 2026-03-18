@@ -201,48 +201,63 @@ fn process_settle(
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
 
-    // NEW: Get the settler/authority account (usually the first or last in the list)
     let settler_acc = next_account_info(account_info_iter)?;
     let game_pda = next_account_info(account_info_iter)?;
     let player_one_info = next_account_info(account_info_iter)?;
     let player_two_info = next_account_info(account_info_iter)?;
     let commission_acc = next_account_info(account_info_iter)?;
 
-    // --- SECURITY CHECKS ---
-
-    // 1. Check if the caller is the authorized settler
+    // --- 1. SECURITY CHECKS ---
     if *settler_acc.key != SETTLER_AUTHORITY {
-        return Err(ProgramError::IllegalOwner); // Or a custom error
+        return Err(ProgramError::IllegalOwner);
     }
 
-    // 2. Ensure the settler actually signed this transaction
     if !settler_acc.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
     let game_data = Game::try_from_slice(&game_pda.data.borrow())?;
 
-    // ... (rest of your existing logic)
     if game_data.status != 2 {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // PRODUCTION SECURITY: Verify hash matches revealed seed
+    // PROVABLY FAIR CHECK
     if hash(&server_seed).to_bytes() != game_data.server_hash {
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    // Logic for winner
+    // --- 2. LOGIC FOR WINNER ---
     let mut combined = Vec::new();
     combined.extend_from_slice(&server_seed);
     combined.extend_from_slice(&game_data.client_seed_a);
     combined.extend_from_slice(&game_data.client_seed_b);
+
     let final_hash = hash(&combined);
     let flip_result = (final_hash.to_bytes()[0] % 2) as u8;
 
-    let total_pool = game_data.amount.checked_mul(2).unwrap();
-    let commission = total_pool / 100; // 1%
-    let winner_prize = total_pool - commission;
+    // --- 3. EMIT HISTORY LOG ---
+    // This is what your frontend history tab will read
+    solana_program::msg!(
+        "FLIP_RESULT: game_id={}, seed_a={:?}, seed_b={:?}, server_seed={:?}, server_hash={:?}, winner_side={}",
+        game_data.game_id,
+        game_data.client_seed_a,
+        game_data.client_seed_b,
+        server_seed,
+        game_data.server_hash,
+        flip_result
+    );
+
+    // --- 4. CALCULATE PAYOUTS ---
+    // Using InvalidAccountData as a fallback for the overflow error
+    let total_pool = game_data
+        .amount
+        .checked_mul(2)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let commission = total_pool / 100;
+    let winner_prize = total_pool
+        .checked_sub(commission)
+        .ok_or(ProgramError::InvalidAccountData)?;
 
     let winner_acc = if flip_result == game_data.player_one_side {
         player_one_info
@@ -250,8 +265,8 @@ fn process_settle(
         player_two_info
     };
 
-    // --- PAYOUT & CLOSE ACCOUNT ---
-    // Transfer prize to winner
+    // --- 5. PAYOUT & CLOSE ACCOUNT ---
+    // Transfer prize
     **game_pda.try_borrow_mut_lamports()? -= winner_prize;
     **winner_acc.try_borrow_mut_lamports()? += winner_prize;
 
@@ -259,12 +274,12 @@ fn process_settle(
     **game_pda.try_borrow_mut_lamports()? -= commission;
     **commission_acc.try_borrow_mut_lamports()? += commission;
 
-    // Refund remaining Rent SOL to Player 1 (Creator) and Close Account
+    // Close PDA and refund rent to creator
     let remaining_rent = game_pda.lamports();
     **game_pda.try_borrow_mut_lamports()? -= remaining_rent;
     **player_one_info.try_borrow_mut_lamports()? += remaining_rent;
 
-    // Wipe data
+    // Clean up data
     let mut data = game_pda.data.borrow_mut();
     data.fill(0);
 

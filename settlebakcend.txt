@@ -1,0 +1,140 @@
+const { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, SystemProgram } = require('@solana/web3.js');
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('bs58'); 
+const bs58 = require('bs58').default;
+
+// --- CONFIGURATION ---
+const PROGRAM_ID = new PublicKey("7B7qKQtG16Gf3qiYY5R5P1ym1AMm6dqffJbbYuyptZwk");
+const COMMISSION_ACC = new PublicKey("3FSdF5cDCjkEsrcLEeCDkNBkLLHtpbSiqpxTbcENnydJ");
+const DEVNET_URL = "https://api.devnet.solana.com";
+const PORT = 3001;
+const DB_PATH = './seeds.json';
+
+// Load House Wallet (The one that pays for settlement gas)
+const houseSecretKey = "4rztChNikWSikhJUXMrmsVDy7w6pWxMoxMogvdBqtQaoXstAbVzkYq7HuXs7mWWRurafjddd8N7Si6cnr9qY7u8C";
+const houseKeypair = Keypair.fromSecretKey(bs58.decode(houseSecretKey));
+
+const connection = new Connection(DEVNET_URL, "confirmed");
+
+// Initialize JSON DB
+if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, JSON.stringify({}));
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// --- HELPER FUNCTIONS ---
+
+function saveSeed(gameId, seedHex) {
+    const data = JSON.parse(fs.readFileSync(DB_PATH));
+    data[gameId] = seedHex;
+    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+}
+
+function getSeed(gameId) {
+    const data = JSON.parse(fs.readFileSync(DB_PATH));
+    return data[gameId];
+}
+
+// --- API ENDPOINT: GENERATE HASH ---
+
+app.post('/generate-game', (req, res) => {
+    try {
+        const { gameId } = req.body;
+        if (!gameId) return res.status(400).json({ error: "Missing gameId" });
+
+        // 1. Generate Secret 32-byte seed
+        const serverSeed = crypto.randomBytes(32);
+        
+        // 2. Create SHA-256 hash (matches Rust 'hash' function)
+        const serverHash = crypto.createHash('sha256').update(serverSeed).digest();
+
+        // 3. Store seed securely
+        saveSeed(gameId.toString(), serverSeed.toString('hex'));
+
+        console.log(`🆕 Game Created: ${gameId} | Hash: ${serverHash.toString('hex').slice(0, 10)}...`);
+
+        res.json({ serverHash: Array.from(serverHash) });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// --- BOT LOGIC: AUTOMATED SETTLEMENT ---
+
+async function settleGame(gamePda, playerOne, playerTwo, gameId) {
+    try {
+        const hexSeed = getSeed(gameId.toString());
+        if (!hexSeed) return console.log(`⚠️ No seed found for game ${gameId}, skipping.`);
+
+        const serverSeed = Buffer.from(hexSeed, 'hex');
+
+        // Data: [discriminator 2 (SettleFlip)] [32b seed]
+        const data = Buffer.alloc(33);
+        data.writeUInt8(2, 0); 
+        serverSeed.copy(data, 1);
+
+        const instruction = new TransactionInstruction({
+            keys: [
+                // 1. The Authorized Settler (must be first as per the updated Rust logic)
+                { pubkey: houseKeypair.publicKey, isSigner: true, isWritable: false },
+                // 2. The Game State
+                { pubkey: gamePda, isSigner: false, isWritable: true },
+                // 3. Player One (to receive rent refund/winnings)
+                { pubkey: playerOne, isSigner: false, isWritable: true },
+                // 4. Player Two (to receive winnings)
+                { pubkey: playerTwo, isSigner: false, isWritable: true },
+                // 5. Commission Vault
+                { pubkey: COMMISSION_ACC, isSigner: false, isWritable: true },
+            ],
+            programId: PROGRAM_ID,
+            data,
+        });
+
+        const tx = new Transaction().add(instruction);
+        
+        // Ensure houseKeypair is included in the signers array
+        const signature = await connection.sendTransaction(tx, [houseKeypair]);
+        
+        console.log(`🎯 SETTLED Game ${gameId}. Sig: ${signature.slice(0, 10)}...`);
+    } catch (err) {
+        console.error(`❌ Settle Error (${gameId}):`, err.message);
+    }
+}
+
+async function scanForJoins() {
+    try {
+        const accounts = await connection.getProgramAccounts(PROGRAM_ID);
+        for (const account of accounts) {
+            const data = account.account.data;
+            if (data.length < 180) continue;
+
+            // Status is at byte 81
+            const status = data.readUInt8(81); 
+
+            if (status === 2) { // Status: Joined
+                const p1 = new PublicKey(data.slice(0, 32));
+                const p2 = new PublicKey(data.slice(32, 64));
+                const gId = data.readBigUInt64LE(73);
+
+                await settleGame(account.pubkey, p1, p2, gId);
+            }
+        }
+    } catch (e) {
+        console.error("Scanner Error:", e.message);
+    }
+}
+
+
+
+// --- START ---
+app.listen(PORT, () => {
+    console.log(`🚀 House API: http://localhost:${PORT}`);
+    console.log(`🤖 Settle Bot: Watching for Joins...`);
+    
+    // Scan every 5 seconds
+    setInterval(scanForJoins, 5000);
+});
