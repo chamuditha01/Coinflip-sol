@@ -109,6 +109,13 @@ useEffect(() => {
 }, [connection, publicKey, flipping]);
 
 
+useEffect(() => {
+    if (historyScrollRef.current) {
+        historyScrollRef.current.scrollLeft = historyScrollRef.current.scrollWidth;
+    }
+    console.log("Current History Array:", gameHistory);
+}, [gameHistory]); // Every time a new game is added, scroll to the end
+
 const fetchHistory = async () => {
     try {
         // 1. Get transaction signatures involving your Program ID
@@ -491,7 +498,7 @@ useEffect(() => {
     style={{ 
         display: 'flex', 
         flexDirection: 'row',         // Standard flow
-        justifyContent: 'flex-end',   // Pushes all content to the right side
+       justifyContent: 'safe flex-end',  // Pushes all content to the right side
         alignItems: 'center',
         gap: '8px', 
         padding: '10px', 

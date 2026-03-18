@@ -5,6 +5,7 @@
   "dependencies": {
     "@coral-xyz/anchor": "^0.29.0",
     "@orao-network/solana-vrf": "^0.8.0",
+    "@particle-network/chains": "^1.8.3",
     "@pythnetwork/pyth-solana-receiver": "^0.14.0",
     "@solana/wallet-adapter-base": "^0.9.27",
     "@solana/wallet-adapter-phantom": "^0.9.28",
@@ -18,17 +19,13 @@
     "@testing-library/user-event": "^13.5.0",
     "ajv": "^8.18.0",
     "bs58": "^6.0.0",
-    "buffer": "^6.0.3",
-    "crypto-browserify": "^3.12.1",
     "js-sha256": "^0.11.1",
     "js-sha3": "^0.9.3",
-    "process": "^0.11.10",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-router-dom": "^7.13.1",
     "react-scripts": "5.0.1",
     "rpc-websockets": "^7.5.0",
-    "stream-browserify": "^3.0.0",
     "tweetnacl": "^1.0.3",
     "vm-browserify": "^1.1.2",
     "web-vitals": "^2.1.4"
@@ -64,6 +61,16 @@
     ]
   },
   "devDependencies": {
-    "react-app-rewired": "^2.2.1"
+    "assert": "^2.1.0",
+    "buffer": "^6.0.3",
+    "crypto-browserify": "^3.12.1",
+    "https-browserify": "^1.0.0",
+    "os-browserify": "^0.3.0",
+    "process": "^0.11.10",
+    "react-app-rewired": "^2.2.1",
+    "stream-browserify": "^3.0.0",
+    "stream-http": "^3.2.0",
+    "string_decoder": "^1.3.0",
+    "url": "^0.11.4"
   }
 }
