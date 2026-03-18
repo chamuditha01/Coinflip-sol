@@ -13,9 +13,9 @@ import { WalletModalProvider, WalletMultiButton } from '@solana/wallet-adapter-r
 require('@solana/wallet-adapter-react-ui/styles.css');
 window.Buffer = Buffer;
 
-const PROGRAM_ID = new web3.PublicKey("7B7qKQtG16Gf3qiYY5R5P1ym1AMm6dqffJbbYuyptZwk");
-const COMMISSION_ADDRESS = new web3.PublicKey("3FSdF5cDCjkEsrcLEeCDkNBkLLHtpbSiqpxTbcENnydJ");
-const HELIUS_RPC = "https://devnet.helius-rpc.com/?api-key=3d1eb615-02f9-4796-ac88-be5f07f93ba5";
+const PROGRAM_ID = new web3.PublicKey(process.env.REACT_APP_PROGRAM_ID);
+const COMMISSION_ADDRESS = new web3.PublicKey(process.env.REACT_APP_COMMISSION_ADDRESS);
+const HELIUS_RPC = process.env.REACT_APP_HELIUS_RPC;
 
 class GameAccount {
     constructor(fields) {
