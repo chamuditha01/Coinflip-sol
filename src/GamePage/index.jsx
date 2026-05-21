@@ -59,6 +59,8 @@ function CoinflipUI() {
     const [selectedHistory, setSelectedHistory] = useState(null);
 // Add this line with your other state declarations
 const historyScrollRef = useRef(null);
+    const settlementHandledRef = useRef(false);
+    const historyRetryRef = useRef(null);
 
 
 // Helper to parse the Rust log format: [1, 2, 3...] into Hex
@@ -70,93 +72,113 @@ const parseLogArray = (str) => {
 
 
 useEffect(() => {
-    if (!connection || !publicKey) return;
-
-    // Lobby Listener
-    const lobbySub = connection.onProgramAccountChange(
-        PROGRAM_ID,
-        () => fetchGames(),
-        'confirmed'
-    );
-
-    let gameSub = null;
-    if (activePdaRef.current && flipping) {
-        gameSub = connection.onAccountChange(
-            activePdaRef.current,
-            (accountInfo) => {
-                try {
-                    const data = borsh.deserialize(gameSchema, GameAccount, accountInfo.data);
-                    if (data.status === 2) {
-                        setSystemMsg("OPPONENT_FOUND! FLIPPING...");
-                    }
-                } catch (e) {
-                    // This block runs when the account is closed (Settled on-chain)
-                    handleSettlement();
-                    
-                    // --- AUTO UPDATE HISTORY HERE ---
-                    // Since the backend just finished, we fetch the new logs
-                    setTimeout(() => fetchHistory(), 2000); 
-                }
-            },
-            'confirmed'
-        );
-    }
-
-    return () => {
-        connection.removeAccountChangeListener(lobbySub);
-        if (gameSub) connection.removeAccountChangeListener(gameSub);
-    };
-}, [connection, publicKey, flipping]);
-
-
-useEffect(() => {
     if (historyScrollRef.current) {
-        historyScrollRef.current.scrollLeft = historyScrollRef.current.scrollWidth;
+        historyScrollRef.current.scrollLeft = Math.max(0, historyScrollRef.current.scrollWidth - historyScrollRef.current.clientWidth);
     }
     console.log("Current History Array:", gameHistory);
 }, [gameHistory]); // Every time a new game is added, scroll to the end
 
-const fetchHistory = async () => {
+const fetchHistory = async (attempt = 0) => {
     try {
-        // 1. Get transaction signatures involving your Program ID
-        const signatures = await connection.getSignaturesForAddress(PROGRAM_ID, { limit: 10 });
+        console.debug(`fetchHistory: attempt=${attempt}`);
         const parsedHistory = [];
+        const seenSignatures = new Set();
+        let before = undefined;
+        let pageCount = 0;
 
-        for (let sig of signatures) {
-            // 2. Fetch the detailed transaction info
-            const tx = await connection.getParsedTransaction(sig.signature, {
-                maxSupportedTransactionVersion: 0,
-            });
+        // Walk multiple signature pages so older settled rounds don't get dropped.
+        while (pageCount < 5) {
+            const signatures = await connection.getSignaturesForAddress(PROGRAM_ID, {
+                limit: 100,
+                ...(before ? { before } : {}),
+            }, 'finalized');
 
-            if (tx && tx.meta && tx.meta.logMessages) {
-                // 3. Find the specific "FLIP_RESULT" log we created in Rust
-                const resultLog = tx.meta.logMessages.find(log => log.includes("FLIP_RESULT"));
-                
-                if (resultLog) {
-                    // Extract data using Regex
-                    const gameId = resultLog.match(/game_id=(\d+)/)?.[1];
-                    const seedA = resultLog.match(/seed_a=\[(.*?)\]/)?.[1];
-                    const seedB = resultLog.match(/seed_b=\[(.*?)\]/)?.[1];
-                    const sSeed = resultLog.match(/server_seed=\[(.*?)\]/)?.[1];
-                    const sHash = resultLog.match(/server_hash=\[(.*?)\]/)?.[1];
-                    const winner = resultLog.match(/winner_side=(\d+)/)?.[1];
+            console.debug(`fetchHistory: page ${pageCount + 1} signatures=${signatures.length} before=${before}`,
+                signatures.length ? [signatures[0].signature, signatures[signatures.length - 1].signature] : []);
 
-                    parsedHistory.push({
-                        gameId,
-                        seedA: parseLogArray(seedA),
-                        seedB: parseLogArray(seedB),
-                        serverSeed: parseLogArray(sSeed),
-                        serverHash: parseLogArray(sHash),
-                        winner: winner === "0" ? "HEADS" : "TAILS",
-                        sig: sig.signature,
-                        time: new Date(sig.blockTime * 1000).toLocaleTimeString()
-                    });
+            if (!signatures.length) break;
+            before = signatures[signatures.length - 1].signature;
+            pageCount += 1;
+
+            for (const sig of signatures) {
+                if (seenSignatures.has(sig.signature)) continue;
+                seenSignatures.add(sig.signature);
+
+                const tx = await connection.getParsedTransaction(sig.signature, {
+                    maxSupportedTransactionVersion: 0,
+                }, 'finalized');
+
+                if (!tx) {
+                    console.debug('fetchHistory: no tx for', sig.signature);
+                    continue;
+                }
+
+                if (tx.meta && tx.meta.logMessages) {
+                    const detailedLog = tx.meta.logMessages.find(log => log.includes("FLIP_RESULT"));
+                    const simpleLog = tx.meta.logMessages.find(log => /RESULT: Side \d+ wins\./.test(log));
+
+                    if (detailedLog || simpleLog) {
+                        const sourceLog = detailedLog || simpleLog;
+                        console.debug('fetchHistory: found settle log in', sig.signature);
+                        console.debug(sourceLog);
+
+                        const gameId = detailedLog
+                            ? detailedLog.match(/game_id=(\d+)/)?.[1]
+                            : (sig.blockTime ? String(sig.blockTime) : sig.signature.slice(0, 12));
+
+                        const seedA = detailedLog ? detailedLog.match(/seed_a=\[(.*?)\]/)?.[1] : null;
+                        const seedB = detailedLog ? detailedLog.match(/seed_b=\[(.*?)\]/)?.[1] : null;
+                        const sSeed = detailedLog ? detailedLog.match(/server_seed=\[(.*?)\]/)?.[1] : null;
+                        const sHash = detailedLog ? detailedLog.match(/server_hash=\[(.*?)\]/)?.[1] : null;
+
+                        const winnerRaw = detailedLog
+                            ? detailedLog.match(/winner_side=(\d+)/)?.[1]
+                            : simpleLog.match(/RESULT: Side (\d+) wins\./)?.[1];
+
+                        parsedHistory.push({
+                            gameId,
+                            seedA: parseLogArray(seedA),
+                            seedB: parseLogArray(seedB),
+                            serverSeed: parseLogArray(sSeed),
+                            serverHash: parseLogArray(sHash),
+                            winner: winnerRaw === "0" ? "HEADS" : "TAILS",
+                            sig: sig.signature,
+                            time: sig.blockTime ? new Date(sig.blockTime * 1000).toLocaleTimeString() : 'N/A'
+                        });
+                    }
                 }
             }
         }
-        setGameHistory(parsedHistory);
+        parsedHistory.sort((a, b) => (Number(b.gameId) || 0) - (Number(a.gameId) || 0));
+
+        setGameHistory(prevHistory => {
+            const beforeLen = prevHistory.length;
+            const merged = [...prevHistory];
+            const seen = new Set(prevHistory.map(item => item.sig));
+
+            for (const item of parsedHistory) {
+                if (!seen.has(item.sig)) {
+                    merged.push(item);
+                    seen.add(item.sig);
+                    console.debug('fetchHistory: merging new item', item.sig, item.gameId);
+                }
+            }
+
+            merged.sort((a, b) => (Number(b.gameId) || 0) - (Number(a.gameId) || 0));
+            console.debug(`fetchHistory: merged history size before=${beforeLen} after=${merged.length}`);
+            return merged;
+        });
+
+        if (parsedHistory.length === 0 && attempt < 6) {
+            if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
+            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1), 2500);
+        }
     } catch (e) {
         console.error("History fetch error:", e);
+        if (attempt < 6) {
+            if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
+            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1), 2500);
+        }
     }
 };
 
@@ -188,23 +210,35 @@ useEffect(() => {
         } catch (e) { console.error("Fetch Error:", e); }
     };
 
-    const handleSettlement = async () => {
+    const finalizeSettlement = async () => {
+        if (settlementHandledRef.current) return;
+        settlementHandledRef.current = true;
+
+        if (historyRetryRef.current) {
+            clearTimeout(historyRetryRef.current);
+            historyRetryRef.current = null;
+        }
+
         setSystemMsg("VERIFYING_OUTCOME...");
         setTimeout(async () => {
-            const currentBalRaw = await connection.getBalance(publicKey);
-            const currentBal = currentBalRaw / web3.LAMPORTS_PER_SOL;
-            
-            let won = currentBal > balanceBeforeFlip.current;
-            const result = won ? selectedSide : (selectedSide === 0 ? 1 : 0);
-            
-            setFlippedResult(result);
-            setResultModal(won ? 'WON' : 'LOST');
-            setSystemMsg(won ? "LOBBY_SETTLED: WINNER" : "LOBBY_SETTLED: LOSER");
-            
-            setBalance(currentBal);
-            setFlipping(false);
-            setLoading(false);
-            activePdaRef.current = null;
+            try {
+                const currentBalRaw = await connection.getBalance(publicKey);
+                const currentBal = currentBalRaw / web3.LAMPORTS_PER_SOL;
+
+                const won = currentBal > balanceBeforeFlip.current;
+                const result = won ? selectedSide : (selectedSide === 0 ? 1 : 0);
+
+                setFlippedResult(result);
+                setResultModal(won ? 'WON' : 'LOST');
+                setSystemMsg(won ? "LOBBY_SETTLED: WINNER" : "LOBBY_SETTLED: LOSER");
+                setBalance(currentBal);
+            } finally {
+                setFlipping(false);
+                setLoading(false);
+                activePdaRef.current = null;
+                settlementHandledRef.current = false;
+                fetchHistory();
+            }
         }, 4000);
     };
 
@@ -226,9 +260,11 @@ useEffect(() => {
                         const data = borsh.deserialize(gameSchema, GameAccount, accountInfo.data);
                         if (data.status === 2) {
                             setSystemMsg("OPPONENT_FOUND! FLIPPING...");
+                        } else if (data.status === 0 || data.status === 3) {
+                            finalizeSettlement();
                         }
                     } catch (e) {
-                        handleSettlement();
+                        finalizeSettlement();
                     }
                 },
                 'confirmed'
@@ -245,6 +281,12 @@ useEffect(() => {
         fetchGames();
         fetchBalance();
     }, [publicKey]);
+
+    useEffect(() => {
+        return () => {
+            if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
+        };
+    }, []);
 
     const createGame = async () => {
         if (!publicKey) return;
@@ -289,6 +331,7 @@ useEffect(() => {
             
             balanceBeforeFlip.current = balance; 
             activePdaRef.current = pda;
+            settlementHandledRef.current = false;
             setFlipping(true);
             setSystemMsg("LOBBY_OPEN: WAITING_FOR_OPPONENT");
             fetchGames();
@@ -335,6 +378,7 @@ useEffect(() => {
             await connection.confirmTransaction(signature, 'confirmed');
             
             activePdaRef.current = game.pubkey;
+            settlementHandledRef.current = false;
             setFlipping(true);
             setSystemMsg("MATCH_LIVE: FLIPPING...");
         } catch (e) { 

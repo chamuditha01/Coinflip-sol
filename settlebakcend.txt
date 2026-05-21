@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, SystemProgram } = require('@solana/web3.js');
 const express = require('express');
 const cors = require('cors');
@@ -5,22 +6,32 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('bs58'); 
 const bs58 = require('bs58').default;
+const { createClient } = require('@supabase/supabase-js');
+
+const supabase = createClient(
+  process.env.SUPABASE_URL, 
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // --- CONFIGURATION ---
-const PROGRAM_ID = new PublicKey("7B7qKQtG16Gf3qiYY5R5P1ym1AMm6dqffJbbYuyptZwk");
-const COMMISSION_ACC = new PublicKey("3FSdF5cDCjkEsrcLEeCDkNBkLLHtpbSiqpxTbcENnydJ");
-const DEVNET_URL = "https://api.devnet.solana.com";
-const PORT = 3001;
-const DB_PATH = './seeds.json';
+// --- CONFIGURATION FROM ENV ---
+const PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID);
+const COMMISSION_ACC = new PublicKey(process.env.COMMISSION_ACC);
+const DEVNET_URL = process.env.DEVNET_URL || "https://api.devnet.solana.com";
+const PORT = process.env.PORT || 3001;
 
-// Load House Wallet (The one that pays for settlement gas)
-const houseSecretKey = "4rztChNikWSikhJUXMrmsVDy7w6pWxMoxMogvdBqtQaoXstAbVzkYq7HuXs7mWWRurafjddd8N7Si6cnr9qY7u8C";
+
+// Load House Wallet
+const houseSecretKey = process.env.HOUSE_SECRET_KEY;
+if (!houseSecretKey) {
+    console.error("❌ HOUSE_SECRET_KEY is missing in .env!");
+    process.exit(1);
+}
 const houseKeypair = Keypair.fromSecretKey(bs58.decode(houseSecretKey));
 
 const connection = new Connection(DEVNET_URL, "confirmed");
 
-// Initialize JSON DB
-if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, JSON.stringify({}));
+
 
 const app = express();
 app.use(cors());
@@ -28,15 +39,24 @@ app.use(express.json());
 
 // --- HELPER FUNCTIONS ---
 
-function saveSeed(gameId, seedHex) {
-    const data = JSON.parse(fs.readFileSync(DB_PATH));
-    data[gameId] = seedHex;
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+async function saveSeed(gameId, seedHex) {
+    const { error } = await supabase
+        .from('game_seeds')
+        .insert([{ game_id: gameId.toString(), seed_hex: seedHex }]);
+    
+    if (error) console.error("Supabase Save Error:", error.message);
 }
 
-function getSeed(gameId) {
-    const data = JSON.parse(fs.readFileSync(DB_PATH));
-    return data[gameId];
+async function getSeed(gameId) {
+    const { data, error } = await supabase
+        .from('game_seeds')
+        .select('seed_hex')
+        .eq('game_id', gameId.toString())
+        .single();
+        
+    if (error || !data) return null;
+    console.log(`🔑 Retrieved seed for Game ${gameId}`);
+    return data.seed_hex;
 }
 
 // --- API ENDPOINT: GENERATE HASH ---
@@ -66,69 +86,112 @@ app.post('/generate-game', (req, res) => {
 // --- BOT LOGIC: AUTOMATED SETTLEMENT ---
 
 async function settleGame(gamePda, playerOne, playerTwo, gameId) {
-    try {
-        const hexSeed = getSeed(gameId.toString());
-        if (!hexSeed) return console.log(`⚠️ No seed found for game ${gameId}, skipping.`);
+    try {
+        // 1. Await the seed from Supabase (Crucial fix for your error)
+        const hexSeed = await getSeed(gameId.toString());
+        
+        if (!hexSeed) {
+            return console.log(`⚠️ No seed found for game ${gameId}, skipping.`);
+        }
 
-        const serverSeed = Buffer.from(hexSeed, 'hex');
+        const serverSeed = Buffer.from(hexSeed, 'hex');
 
-        // Data: [discriminator 2 (SettleFlip)] [32b seed]
-        const data = Buffer.alloc(33);
-        data.writeUInt8(2, 0); 
-        serverSeed.copy(data, 1);
+        // 2. Build Instruction Data: [discriminator 2] [32b seed]
+        const data = Buffer.alloc(33);
+        data.writeUInt8(2, 0); 
+        serverSeed.copy(data, 1);
 
-        const instruction = new TransactionInstruction({
-            keys: [
-                // 1. The Authorized Settler (must be first as per the updated Rust logic)
-                { pubkey: houseKeypair.publicKey, isSigner: true, isWritable: false },
-                // 2. The Game State
-                { pubkey: gamePda, isSigner: false, isWritable: true },
-                // 3. Player One (to receive rent refund/winnings)
-                { pubkey: playerOne, isSigner: false, isWritable: true },
-                // 4. Player Two (to receive winnings)
-                { pubkey: playerTwo, isSigner: false, isWritable: true },
-                // 5. Commission Vault
-                { pubkey: COMMISSION_ACC, isSigner: false, isWritable: true },
-            ],
-            programId: PROGRAM_ID,
-            data,
-        });
+        const instruction = new TransactionInstruction({
+            keys: [
+                // 1. The Authorized Settler (House Wallet)
+                { pubkey: houseKeypair.publicKey, isSigner: true, isWritable: false },
+                // 2. The Game State Account
+                { pubkey: gamePda, isSigner: false, isWritable: true },
+                // 3. Player One
+                { pubkey: playerOne, isSigner: false, isWritable: true },
+                // 4. Player Two
+                { pubkey: playerTwo, isSigner: false, isWritable: true },
+                // 5. Commission Vault
+                { pubkey: COMMISSION_ACC, isSigner: false, isWritable: true },
+            ],
+            programId: PROGRAM_ID,
+            data,
+        });
 
-        const tx = new Transaction().add(instruction);
-        
-        // Ensure houseKeypair is included in the signers array
-        const signature = await connection.sendTransaction(tx, [houseKeypair]);
-        
-        console.log(`🎯 SETTLED Game ${gameId}. Sig: ${signature.slice(0, 10)}...`);
-    } catch (err) {
-        console.error(`❌ Settle Error (${gameId}):`, err.message);
-    }
+        // 3. Send and Confirm Transaction
+        const tx = new Transaction().add(instruction);
+        
+        // Using sendAndConfirmTransaction is better for bots to ensure the next 
+        // scan doesn't try to settle the same game twice while one is pending.
+        const signature = await connection.sendTransaction(tx, [houseKeypair], {
+            skipPreflight: false,
+            preflightCommitment: 'confirmed'
+        });
+        
+        console.log(`🎯 SETTLED Game ${gameId}. Sig: ${signature.slice(0, 10)}...`);
+
+        // 4. Cleanup: Delete the seed from Supabase now that it's settled
+        await supabase
+            .from('game_seeds')
+            .delete()
+            .eq('game_id', gameId.toString());
+
+    } catch (err) {
+        // Catch specific Solana errors (like 'already processed' if the bot double-fires)
+        if (err.message.includes("already be processed")) {
+             console.log(`ℹ️ Game ${gameId} already settled.`);
+        } else {
+             console.error(`❌ Settle Error (${gameId}):`, err.message);
+        }
+    }
 }
 
 async function scanForJoins() {
-    try {
-        const accounts = await connection.getProgramAccounts(PROGRAM_ID);
-        for (const account of accounts) {
-            const data = account.account.data;
-            if (data.length < 180) continue;
+    try {
+        // 1. Fetch all accounts owned by your program
+        const accounts = await connection.getProgramAccounts(PROGRAM_ID);
+        
+        console.log(`🔍 Scanning ${accounts.length} accounts for active matches...`);
 
-            // Status is at byte 81
-            const status = data.readUInt8(81); 
+        for (const account of accounts) {
+            const data = account.account.data;
+            
+            // Basic length check to avoid system/rent accounts
+            if (data.length < 180) continue;
 
-            if (status === 2) { // Status: Joined
-                const p1 = new PublicKey(data.slice(0, 32));
-                const p2 = new PublicKey(data.slice(32, 64));
-                const gId = data.readBigUInt64LE(73);
+            // 2. Read the Status Byte (at index 81)
+            const status = data.readUInt8(81); 
 
-                await settleGame(account.pubkey, p1, p2, gId);
-            }
-        }
-    } catch (e) {
-        console.error("Scanner Error:", e.message);
-    }
+            // status === 2 means "Joined" (Ready for settlement)
+            if (status === 2) { 
+                // 3. Extract necessary PublicKeys and Game ID from the buffer
+                const p1 = new PublicKey(data.slice(0, 32));
+                const p2 = new PublicKey(data.slice(32, 64));
+                const gId = data.readBigUInt64LE(73);
+
+                console.log(`🎰 Match Found! GameID: ${gId}. Starting settlement...`);
+
+                // 4. CRITICAL: Use 'await' here.
+                // This ensures the House wallet finishes one transaction 
+                // before starting the next to prevent Nonce/Sequence errors.
+                await settleGame(account.pubkey, p1, p2, gId);
+            }
+        }
+    } catch (e) {
+        console.error("❌ Scanner Error:", e.message);
+    }
 }
 
-
+// Add this below your /generate-game endpoint
+app.get('/test-db', async (req, res) => {
+    try {
+        const { data, error } = await supabase.from('game_seeds').select('count');
+        if (error) throw error;
+        res.json({ status: "Connected", message: "Supabase is reachable!", data });
+    } catch (e) {
+        res.status(500).json({ status: "Error", error: e.message });
+    }
+});
 
 // --- START ---
 app.listen(PORT, () => {
