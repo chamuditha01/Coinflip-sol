@@ -1,0 +1,37 @@
+.shell-layout{
+  display:flex;
+  min-height:100vh;
+  background:#071018;
+}
+.sidebar-shell{
+  width:220px;
+  background:linear-gradient(180deg,#0b1116,#071018);
+  border-right:1px solid rgba(255,255,255,0.03);
+  padding:18px;
+  box-sizing:border-box;
+}
+.brand-block{margin-bottom:18px}
+.brand-title{font-weight:800;color:#fff;margin-bottom:6px}
+.brand-subtitle{font-size:11px;color:#8a939f}
+.brand-meta{font-size:10px;color:#5b6570;margin-top:8px}
+.side-nav{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.side-nav-item{background:transparent;border:0;color:#9aa6b2;padding:10px;text-align:left;cursor:pointer;border-radius:8px}
+.side-nav-item.active{background:rgba(20,241,149,0.08);color:#14F195}
+.verify-cta{margin-top:18px;width:100%;padding:10px;border-radius:8px;background:#14F195;color:#041018;border:0;font-weight:800}
+.main-shell{flex:1;display:flex;flex-direction:column}
+.topbar-shell{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;border-bottom:1px solid rgba(255,255,255,0.02)}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.shell-badge{font-size:12px;color:#8a939f}
+.topbar-right{display:flex;align-items:center;gap:12px}
+
+/* keep existing main content styles untouched; Layout only provides structure */
+
+@media (max-width: 900px) {
+  .shell-layout{flex-direction:column}
+  .sidebar-shell{width:100%;display:flex;flex-direction:row;align-items:center;gap:12px;padding:10px}
+  .side-nav{flex-direction:row;gap:8px;overflow:auto}
+  .side-nav-item{padding:8px 10px;white-space:nowrap}
+  .main-shell{width:100%}
+  .topbar-shell{padding:8px 12px}
+  .verify-cta{display:none}
+}

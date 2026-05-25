@@ -1,11 +1,11 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import * as web3 from '@solana/web3.js';
 import * as borsh from 'borsh';
+import bs58 from 'bs58';
 import { Buffer } from 'buffer';
 import './App.css';
 import { useNavigate } from 'react-router-dom';
-
-// Solana Wallet Adapter
+import Layout from '../components/Layout';
 import { ConnectionProvider, WalletProvider, useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-wallets';
 import { WalletModalProvider, WalletMultiButton } from '@solana/wallet-adapter-react-ui';
@@ -61,6 +61,8 @@ function CoinflipUI() {
 const historyScrollRef = useRef(null);
     const settlementHandledRef = useRef(false);
     const historyRetryRef = useRef(null);
+    const historyFetchInFlightRef = useRef(false);
+    const historyLastFetchAtRef = useRef(0);
 
 
 // Helper to parse the Rust log format: [1, 2, 3...] into Hex
@@ -70,6 +72,42 @@ const parseLogArray = (str) => {
     return Buffer.from(bytes).toString('hex');
 };
 
+const bytesToHex = (bytes) => Buffer.from(bytes).toString('hex');
+
+const readU64LE = (bytes, offset) => {
+    const view = new DataView(Uint8Array.from(bytes).buffer);
+    return Number(view.getBigUint64(offset, true));
+};
+
+const decodeInstructionData = (data) => {
+    try {
+        return bs58.decode(data);
+    } catch (e) {
+        return null;
+    }
+};
+
+const toKeyString = (value) => {
+    if (!value) return null;
+    if (typeof value === 'string') return value;
+    if (value.pubkey) return value.pubkey.toString();
+    if (value.toBase58) return value.toBase58();
+    if (value.toString) return value.toString();
+    return null;
+};
+
+const getInstructionProgramId = (instruction, accountKeys) => {
+    if (!instruction) return null;
+    if (typeof instruction.programIdIndex === 'number') {
+        return accountKeys[instruction.programIdIndex] || null;
+    }
+    return toKeyString(instruction.programId);
+};
+
+const getInstructionAccounts = (instruction, accountKeys) => {
+    const rawIndexes = instruction?.accounts || [];
+    return rawIndexes.map(index => accountKeys[index]).filter(Boolean);
+};
 
 useEffect(() => {
     if (historyScrollRef.current) {
@@ -78,77 +116,173 @@ useEffect(() => {
     console.log("Current History Array:", gameHistory);
 }, [gameHistory]); // Every time a new game is added, scroll to the end
 
-const fetchHistory = async (attempt = 0) => {
+const fetchParsedTransactionsInBatches = async (signatures, commitment = 'finalized', concurrency = 4) => {
+    const txMap = new Map();
+    for (let i = 0; i < signatures.length; i += concurrency) {
+        const chunk = signatures.slice(i, i + concurrency);
+        const promises = chunk.map(s => connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 }, commitment)
+            .then(tx => ({ sig: s.signature, tx }))
+            .catch(err => ({ sig: s.signature, tx: null })));
+
+        const resolved = await Promise.all(promises);
+        for (const r of resolved) if (r.tx) txMap.set(r.sig, r.tx);
+        // gentle pause to avoid hitting rate limits
+        await new Promise(res => setTimeout(res, 120));
+    }
+    return txMap;
+};
+
+const fetchHistory = async (attempt = 0, commitment = 'confirmed', force = false) => {
     try {
+        const now = Date.now();
+        if (historyFetchInFlightRef.current) return;
+        if (!force && now - historyLastFetchAtRef.current < 15000) return;
+        historyFetchInFlightRef.current = true;
         console.debug(`fetchHistory: attempt=${attempt}`);
         const parsedHistory = [];
         const seenSignatures = new Set();
         let before = undefined;
         let pageCount = 0;
+        const allSigs = [];
+        const createByGameId = new Map();
+        const createByPda = new Map();
+        const joinByPda = new Map();
 
-        // Walk multiple signature pages so older settled rounds don't get dropped.
-        while (pageCount < 5) {
-            const signatures = await connection.getSignaturesForAddress(PROGRAM_ID, {
-                limit: 100,
+        // Walk multiple signature pages collecting signatures only
+        while (pageCount < 3) {
+            const sigs = await connection.getSignaturesForAddress(PROGRAM_ID, {
+                limit: 1000,
                 ...(before ? { before } : {}),
-            }, 'finalized');
+            }, commitment);
 
-            console.debug(`fetchHistory: page ${pageCount + 1} signatures=${signatures.length} before=${before}`,
-                signatures.length ? [signatures[0].signature, signatures[signatures.length - 1].signature] : []);
+            console.debug(`fetchHistory: collected page ${pageCount + 1} sigs=${sigs.length} before=${before}`,
+                sigs.length ? [sigs[0].signature, sigs[sigs.length - 1].signature] : []);
 
-            if (!signatures.length) break;
-            before = signatures[signatures.length - 1].signature;
+            if (!sigs.length) break;
+            before = sigs[sigs.length - 1].signature;
             pageCount += 1;
 
-            for (const sig of signatures) {
-                if (seenSignatures.has(sig.signature)) continue;
-                seenSignatures.add(sig.signature);
+            for (const s of sigs) {
+                if (!seenSignatures.has(s.signature)) {
+                    seenSignatures.add(s.signature);
+                    allSigs.push(s);
+                }
+            }
+        }
 
-                const tx = await connection.getParsedTransaction(sig.signature, {
-                    maxSupportedTransactionVersion: 0,
-                }, 'finalized');
+        if (!allSigs.length) {
+            // no signatures found - schedule retry
+            if (attempt < 2) {
+                if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
+                historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1, 'finalized', true), 6000);
+            }
+            return;
+        }
 
-                if (!tx) {
-                    console.debug('fetchHistory: no tx for', sig.signature);
-                    continue;
+        // Fetch parsed transactions in parallel batches
+        const txMap = await fetchParsedTransactionsInBatches(allSigs, attempt === 0 ? commitment : 'finalized', 4);
+
+        // PASS 1: Build create/join maps first (oldest to newest)
+        const allSigsReversed = [...allSigs].reverse();
+        for (const s of allSigsReversed) {
+            const tx = txMap.get(s.signature);
+            if (!tx) continue;
+
+            const message = tx.transaction?.message;
+            const accountKeys = message?.accountKeys?.map(toKeyString) || [];
+            const instruction = message?.instructions?.find(ix => getInstructionProgramId(ix, accountKeys) === PROGRAM_ID.toBase58());
+            const decoded = decodeInstructionData(instruction?.data);
+            const accounts = getInstructionAccounts(instruction, accountKeys);
+
+            if (decoded && decoded.length) {
+                const variant = decoded[0];
+
+                if (variant === 0) {
+                    const gamePda = accounts[0];
+                    const playerOne = accounts[1];
+                    const gameId = readU64LE(decoded, 1);
+                    const amountLamports = readU64LE(decoded, 9);
+                    const playerOneSide = decoded[17];
+                    const serverHash = bytesToHex(decoded.slice(18, 50));
+                    const seedA = bytesToHex(decoded.slice(50, 82));
+
+                    if (gamePda && gameId !== null && gameId !== undefined) {
+                        const existing = createByGameId.get(String(gameId)) || {};
+                        const next = {
+                            ...existing,
+                            gamePda,
+                            gameId: String(gameId),
+                            playerOne,
+                            amountLamports,
+                            playerOneSide,
+                            seedA,
+                            serverHash,
+                        };
+                        createByGameId.set(String(gameId), next);
+                        createByPda.set(gamePda, next);
+                    }
                 }
 
-                if (tx.meta && tx.meta.logMessages) {
-                    const detailedLog = tx.meta.logMessages.find(log => log.includes("FLIP_RESULT"));
-                    const simpleLog = tx.meta.logMessages.find(log => /RESULT: Side \d+ wins\./.test(log));
-
-                    if (detailedLog || simpleLog) {
-                        const sourceLog = detailedLog || simpleLog;
-                        console.debug('fetchHistory: found settle log in', sig.signature);
-                        console.debug(sourceLog);
-
-                        const gameId = detailedLog
-                            ? detailedLog.match(/game_id=(\d+)/)?.[1]
-                            : (sig.blockTime ? String(sig.blockTime) : sig.signature.slice(0, 12));
-
-                        const seedA = detailedLog ? detailedLog.match(/seed_a=\[(.*?)\]/)?.[1] : null;
-                        const seedB = detailedLog ? detailedLog.match(/seed_b=\[(.*?)\]/)?.[1] : null;
-                        const sSeed = detailedLog ? detailedLog.match(/server_seed=\[(.*?)\]/)?.[1] : null;
-                        const sHash = detailedLog ? detailedLog.match(/server_hash=\[(.*?)\]/)?.[1] : null;
-
-                        const winnerRaw = detailedLog
-                            ? detailedLog.match(/winner_side=(\d+)/)?.[1]
-                            : simpleLog.match(/RESULT: Side (\d+) wins\./)?.[1];
-
-                        parsedHistory.push({
-                            gameId,
-                            seedA: parseLogArray(seedA),
-                            seedB: parseLogArray(seedB),
-                            serverSeed: parseLogArray(sSeed),
-                            serverHash: parseLogArray(sHash),
-                            winner: winnerRaw === "0" ? "HEADS" : "TAILS",
-                            sig: sig.signature,
-                            time: sig.blockTime ? new Date(sig.blockTime * 1000).toLocaleTimeString() : 'N/A'
+                if (variant === 1) {
+                    const gamePda = accounts[0];
+                    const existing = gamePda ? (createByPda.get(gamePda) || {}) : {};
+                    if (gamePda) {
+                        joinByPda.set(gamePda, {
+                            ...existing,
+                            playerTwo: accounts[1] || existing.playerTwo || null,
+                            seedB: bytesToHex(decoded.slice(1, 33)),
                         });
                     }
                 }
             }
         }
+
+        // PASS 2: Process settle logs with fully populated maps
+        for (const s of allSigs) {
+            const tx = txMap.get(s.signature);
+            if (!tx) continue;
+
+            const message = tx.transaction?.message;
+            const accountKeys = message?.accountKeys?.map(toKeyString) || [];
+            const instruction = message?.instructions?.find(ix => getInstructionProgramId(ix, accountKeys) === PROGRAM_ID.toBase58());
+            const accounts = getInstructionAccounts(instruction, accountKeys);
+
+            if (tx.meta && tx.meta.logMessages) {
+                const detailedLog = tx.meta.logMessages.find(log => log.includes("FLIP_RESULT"));
+                const simpleLog = tx.meta.logMessages.find(log => /RESULT: Side \d+ wins\./.test(log));
+
+                if (detailedLog || simpleLog) {
+                    const settleGamePda = accounts[1];
+                    const fallbackGame = settleGamePda ? (createByPda.get(settleGamePda) || {}) : {};
+                    const fallbackJoin = fallbackGame.gamePda ? (joinByPda.get(fallbackGame.gamePda) || {}) : {};
+
+                    const gameId = detailedLog
+                        ? detailedLog.match(/game_id=(\d+)/)?.[1]
+                        : (fallbackGame.gameId || (s.blockTime ? String(s.blockTime) : s.signature.slice(0, 12)));
+
+                    const seedA = detailedLog ? detailedLog.match(/seed_a=\[(.*?)\]/)?.[1] : null;
+                    const seedB = detailedLog ? detailedLog.match(/seed_b=\[(.*?)\]/)?.[1] : null;
+                    const sSeed = detailedLog ? detailedLog.match(/server_seed=\[(.*?)\]/)?.[1] : null;
+                    const sHash = detailedLog ? detailedLog.match(/server_hash=\[(.*?)\]/)?.[1] : null;
+
+                    const winnerRaw = detailedLog
+                        ? detailedLog.match(/winner_side=(\d+)/)?.[1]
+                        : simpleLog.match(/RESULT: Side (\d+) wins\./)?.[1];
+
+                    parsedHistory.push({
+                        gameId,
+                        seedA: seedA ? parseLogArray(seedA) : (fallbackGame.seedA || 'N/A'),
+                        seedB: seedB ? parseLogArray(seedB) : (fallbackJoin.seedB || 'N/A'),
+                        serverSeed: sSeed ? parseLogArray(sSeed) : 'N/A',
+                        serverHash: sHash ? parseLogArray(sHash) : (fallbackGame.serverHash || 'N/A'),
+                        winner: winnerRaw === "0" ? "HEADS" : "TAILS",
+                        sig: s.signature,
+                        time: s.blockTime ? new Date(s.blockTime * 1000).toLocaleTimeString() : 'N/A'
+                    });
+                }
+            }
+        }
+
         parsedHistory.sort((a, b) => (Number(b.gameId) || 0) - (Number(a.gameId) || 0));
 
         setGameHistory(prevHistory => {
@@ -169,22 +303,30 @@ const fetchHistory = async (attempt = 0) => {
             return merged;
         });
 
-        if (parsedHistory.length === 0 && attempt < 6) {
+        historyLastFetchAtRef.current = now;
+
+        // If nothing parsed on the fast 'confirmed' pass, retry once with 'finalized'
+        if (parsedHistory.length === 0 && attempt === 0) {
             if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
-            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1), 2500);
+            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1, 'finalized', true), 7000);
+        } else if (parsedHistory.length === 0 && attempt < 2) {
+            if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
+            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1, 'finalized', true), 9000);
         }
     } catch (e) {
         console.error("History fetch error:", e);
-        if (attempt < 6) {
+        if (attempt < 2) {
             if (historyRetryRef.current) clearTimeout(historyRetryRef.current);
-            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1), 2500);
+            historyRetryRef.current = setTimeout(() => fetchHistory(attempt + 1, 'finalized', true), 9000);
         }
+    } finally {
+        historyFetchInFlightRef.current = false;
     }
 };
 
 // Call this in a useEffect or after a game settles
 useEffect(() => {
-    if (publicKey) fetchHistory();
+    if (publicKey) fetchHistory(0, 'confirmed', false);
 }, [publicKey]);
     
     const balanceBeforeFlip = useRef(0);
@@ -237,7 +379,7 @@ useEffect(() => {
                 setLoading(false);
                 activePdaRef.current = null;
                 settlementHandledRef.current = false;
-                fetchHistory();
+                fetchHistory(0, 'finalized', true);
             }
         }, 4000);
     };
@@ -406,51 +548,120 @@ useEffect(() => {
                 </div>
             )}
 
-            <div style={{ padding: '40px', maxWidth: '1000px', margin: '0 auto' }}>
-                <div className="header-row">
-                    <h1 className="logo-text">SOL_FLIP_v2</h1>
-                    <div className="wallet-info">
-                        <div className="glass-panel balance-box">⚡ {balance.toFixed(3)} SOL</div>
-                        <WalletMultiButton />
-                        <div className="glass-panel balance-box">
-                        <button 
-      onClick={() => navigate('/verify')} // Change this path to your target route
-      style={{
-        padding: '10px 20px',
-        backgroundColor: '#512da8', // Standard Solana purple
-        color: 'white',
-        border: 'none',
-        borderRadius: '8px',
-        width: '100%',
-        height:'100%',
-        cursor: 'pointer',
-        fontWeight: 'bold',
-        marginTop:'10px'
-      }}
-    >
-      Verify Game
-    </button></div>
-                    </div>
-                    
-                </div>
+            <Layout rightContent={
+                <>
+                    <div className="wallet-balance">{balance.toFixed(3)} SOL</div>
+                    <WalletMultiButton />
+                </>
+            }>
+                    <section className="hero-stage">
+                        <div className={`hero-coin ${flipping ? 'flipping' : ''}`}>
+                            <div className="coin-face coin-heads">H</div>
+                            <div className="coin-face coin-tails">T</div>
+                        </div>
+
+                        <div className="control-panel glass-panel main-controls">
+                            <p className="status-msg">{'>'} {systemMsg}</p>
+                            <div className="input-group">
+                                <input type="number" value={wager} onChange={e => setWager(e.target.value)} className="wager-input" disabled={flipping} />
+
+                                <div className="side-toggle">
+                                    <button 
+                                        onClick={() => setSelectedSide(0)} 
+                                        className={`side-btn ${selectedSide === 0 ? 'active' : ''}`}
+                                    >
+                                        HEADS
+                                    </button>
+                                    <button 
+                                        onClick={() => setSelectedSide(1)} 
+                                        className={`side-btn ${selectedSide === 1 ? 'active' : ''}`}
+                                    >
+                                        TAILS
+                                    </button>
+                                </div>
+
+                                <button className="btn-primary create-btn" onClick={createGame} disabled={loading || flipping}>
+                                    {loading && !flipping ? "SIGNING..." : "CREATE LOBBY"}
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section className="section-block">
+                        <div className="section-head">
+                            <h2 className="section-title">ACTIVE_LOBBIES</h2>
+                            <div className="section-count">{openGames.length} TOTAL</div>
+                        </div>
+
+                        <div className="lobby-grid">
+                            {openGames.map(g => (
+                                <div key={g.pubkey.toBase58()} className="glass-panel lobby-card">
+                                    <div className="lobby-card-top">
+                                        <p className="lobby-amount">{Number(g.amount)/1e9} SOL</p>
+                                        <span className="lobby-chip">{g.player_one_side === 0 ? 'HEADS' : 'TAILS'}</span>
+                                    </div>
+                                    <p className="lobby-id">ID: {g.pubkey.toBase58().slice(0, 6)}...{g.pubkey.toBase58().slice(-4)}</p>
+                                    <p className="lobby-creator">CREATOR: {g.player_one.toBase58().slice(0,8)}...</p>
+                                    <button className="btn-primary join-btn" onClick={() => joinGame(g)} disabled={loading || flipping}>
+                                        {publicKey && g.player_one.equals(publicKey) ? "YOUR LOBBY" : "JOIN MATCH"}
+                                    </button>
+                                </div>
+                            ))}
+
+                            {openGames.length === 0 && <p className="no-lobbies">No active lobbies found...</p>}
+                        </div>
+                    </section>
+
+                    <section className="section-block history-shell">
+                        <div className="section-head">
+                            <h2 className="section-title">HISTORY</h2>
+                            <div className="section-count">LIVE FEED</div>
+                        </div>
+
+                        <div
+                            className="history-bar-container"
+                            ref={historyScrollRef}
+                        >
+                            {[...gameHistory].reverse().map((h, i) => {
+                                const isNewest = i === gameHistory.length - 1;
+                                return (
+                                    <div 
+                                        key={i}
+                                        className="history-pill"
+                                        onClick={() => setSelectedHistory(h)}
+                                        title={`Game ${h.gameId}`}
+                                        style={{
+                                            backgroundColor: h.winner === 'HEADS' ? '#14F195' : '#9945FF',
+                                            boxShadow: isNewest ? `0 0 12px ${h.winner === 'HEADS' ? '#14F195' : '#9945FF'}` : 'none',
+                                            border: isNewest ? '1px solid rgba(255,255,255,0.8)' : '1px solid rgba(255,255,255,0.05)',
+                                            opacity: isNewest ? 1 : 0.72
+                                        }}
+                                    />
+                                );
+                            })}
+                        </div>
+                    </section>
+
+                </Layout>
+
 {/* --- POPUP MODAL FOR HISTORY DETAILS --- */}
 {selectedHistory && (
     <div 
         className="result-overlay" 
         style={{ 
-            position: 'fixed', // Pins to the window, not the container
+            position: 'fixed',
             top: 0, 
             left: 0, 
             width: '100vw', 
             height: '100vh', 
-            zIndex: 9999,      // Ensures it is above everything
+            zIndex: 9999,
             backgroundColor: 'rgba(0, 0, 0, 0.85)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             backdropFilter: 'blur(4px)'
         }}
-        onClick={() => setSelectedHistory(null)} // Close when clicking outside
+        onClick={() => setSelectedHistory(null)}
     >
         <div 
             className="glass-panel" 
@@ -462,7 +673,7 @@ useEffect(() => {
                 background: '#141a21',
                 boxShadow: '0 20px 50px rgba(0,0,0,0.5)'
             }}
-            onClick={(e) => e.stopPropagation()} // Prevents closing when clicking inside
+            onClick={(e) => e.stopPropagation()}
         >
             <div className="card-header" style={{ marginBottom: '25px', display: 'flex', alignItems: 'center', gap: '10px' }}>
                 <div className="status-dot"></div>
@@ -523,7 +734,7 @@ useEffect(() => {
                     width: '100%', 
                     marginTop: '25px', 
                     padding: '16px',
-                    background: '#9945FF', // Matching your purple button
+                    background: '#9945FF',
                     boxShadow: '0 0 15px rgba(153, 69, 255, 0.4)'
                 }} 
                 onClick={() => setSelectedHistory(null)}
@@ -534,104 +745,7 @@ useEffect(() => {
     </div>
 )}
 
-
-
-    <div 
-    className="history-bar-container" 
-    ref={historyScrollRef}
-    style={{ 
-        display: 'flex', 
-        flexDirection: 'row',         // Standard flow
-       justifyContent: 'safe flex-end',  // Pushes all content to the right side
-        alignItems: 'center',
-        gap: '8px', 
-        padding: '10px', 
-        background: 'rgba(0,0,0,0.3)', 
-        borderRadius: '10px',
-        overflowX: 'auto',
-        minHeight: '40px',
-        width: '100%',                // Ensure container spans full width
-        boxSizing: 'border-box'
-    }}
->
-    {/* We slice().reverse() so index 0 (newest) appears at the end of the row (right) */}
-    {[...gameHistory].reverse().map((h, i) => {
-        // Since we reversed, the newest game is now the last index in the map
-        const isNewest = i === gameHistory.length - 1; 
-
-        return (
-            <div 
-                key={i} 
-                className="history-pill"
-                onClick={() => setSelectedHistory(h)}
-                style={{
-                    height: '24px',
-                    width: '12px',
-                    borderRadius: '10px',
-                    cursor: 'pointer',
-                    transition: 'all 0.2s ease',
-                    flexShrink: 0,
-                    backgroundColor: h.winner === 'HEADS' ? '#14F195' : '#9945FF',
-                    boxShadow: isNewest ? `0 0 12px ${h.winner === 'HEADS' ? '#14F195' : '#9945FF'}` : 'none',
-                    border: isNewest ? '1px solid white' : 'none',
-                    opacity: isNewest ? 1 : 0.7
-                }}
-            />
-        );
-    })}
-</div>
-
-                <div className="coin-container">
-                    <div className={`coin ${flipping ? 'flipping' : ''}`}>
-                        <div className="coin-front">H</div>
-                        <div className="coin-back">T</div>
-                    </div>
-                </div>
-
-                <div className="glass-panel main-controls">
-                    <p className="status-msg">{'>'} {systemMsg}</p>
-                    <div className="input-group">
-                        <input type="number" value={wager} onChange={e => setWager(e.target.value)} className="wager-input" disabled={flipping} />
-                        
-                        <div className="side-toggle">
-                            <button 
-                                onClick={() => setSelectedSide(0)} 
-                                className={`side-btn ${selectedSide === 0 ? 'active' : ''}`}
-                            >
-                                HEADS
-                            </button>
-                            <button 
-                                onClick={() => setSelectedSide(1)} 
-                                className={`side-btn ${selectedSide === 1 ? 'active' : ''}`}
-                            >
-                                TAILS
-                            </button>
-                        </div>
-
-                        <button className="btn-primary create-btn" onClick={createGame} disabled={loading || flipping}>
-                            {loading && !flipping ? "SIGNING..." : "CREATE LOBBY"}
-                        </button>
-                    </div>
-                </div>
-
-                <h2 className="section-title">ACTIVE_LOBBIES</h2>
-                <div className="lobby-grid">
-                    {openGames.map(g => (
-                        <div key={g.pubkey.toBase58()} className="glass-panel lobby-card">
-                            <p className="lobby-amount">{Number(g.amount)/1e9} SOL</p>
-                            <p className="lobby-creator">BY: {g.player_one.toBase58().slice(0,8)}...</p>
-                            <p className="lobby-side">CREATOR PICKED: {g.player_one_side === 0 ? "HEADS" : "TAILS"}</p>
-                            <button className="btn-primary join-btn" onClick={() => joinGame(g)} disabled={loading || flipping}>
-                                {publicKey && g.player_one.equals(publicKey) ? "YOUR LOBBY" : "JOIN & FLIP"}
-                            </button>
-                        </div>
-                    ))}
-                    {openGames.length === 0 && <p className="no-lobbies">No active lobbies found...</p>}
-                </div>
-
-                
-            </div>
-        </div>
+    </div>
     );
 }
 

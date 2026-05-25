@@ -130,11 +130,7 @@ async function settleGame(gamePda, playerOne, playerTwo, gameId) {
         
         console.log(`🎯 SETTLED Game ${gameId}. Sig: ${signature.slice(0, 10)}...`);
 
-        // 4. Cleanup: Delete the seed from Supabase now that it's settled
-        await supabase
-            .from('game_seeds')
-            .delete()
-            .eq('game_id', gameId.toString());
+        // Keep the seed record so the frontend can verify older history entries later.
 
     } catch (err) {
         // Catch specific Solana errors (like 'already processed' if the bot double-fires)

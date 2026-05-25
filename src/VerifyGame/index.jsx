@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
 import CryptoJS from 'crypto-js';
+import { useNavigate } from 'react-router-dom';
 import './App.css';
+import Layout from '../components/Layout';
 
 const VerifyGame = () => {
     const [activeTab, setActiveTab] = useState('js');
+    const navigate = useNavigate();
     
     // UI State
     const [serverHash, setServerHash] = useState('');
@@ -247,7 +250,14 @@ body {
     };
 
     return (
-        <div className="v-split-container">
+        <div className="verify-shell">
+            <Layout rightContent={
+                <>
+                    <div className="verify-balance">0.00 SOL</div>
+                    <button type="button" className="verify-wallet-btn">CONNECT WALLET</button>
+                </>
+            }>
+                <div className="v-split-container">
             {/* LEFT: CODE PANEL */}
             <div className="v-editor">
                 <div className="v-tabs" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingRight: '15px' }}>
@@ -335,6 +345,8 @@ body {
                     <div id="resultArea"></div>
                 </div>
             </div>
+                </div>
+            </Layout>
         </div>
     );
 };
