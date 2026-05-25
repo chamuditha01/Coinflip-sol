@@ -19,6 +19,7 @@ const PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID);
 const COMMISSION_ACC = new PublicKey(process.env.COMMISSION_ACC);
 const DEVNET_URL = process.env.DEVNET_URL || "https://api.devnet.solana.com";
 const PORT = process.env.PORT || 3001;
+const SETTLEMENTS_TABLE = process.env.SETTLEMENTS_TABLE || 'leaderboard';
 
 
 // Load House Wallet
@@ -44,7 +45,68 @@ async function saveSeed(gameId, seedHex) {
         .from('game_seeds')
         .insert([{ game_id: gameId.toString(), seed_hex: seedHex }]);
     
-    if (error) console.error("Supabase Save Error:", error.message);
+    if (error) {
+        throw new Error(`Supabase Save Error: ${error.message}`);
+    }
+}
+
+function toBase58String(value) {
+    if (!value) return null;
+    if (typeof value === 'string') return value;
+    if (typeof value.toBase58 === 'function') return value.toBase58();
+    if (value.pubkey && typeof value.pubkey.toBase58 === 'function') return value.pubkey.toBase58();
+    return String(value);
+}
+
+async function saveSettlementResult(roundId, winner, prize) {
+    const { error } = await supabase
+        .from(SETTLEMENTS_TABLE)
+        .insert([{ 
+            roundid: roundId.toString(),
+            winner,
+            prize: prize.toString()
+        }]);
+
+    if (error) {
+        throw new Error(`Supabase Settlement Save Error: ${error.message}`);
+    }
+}
+
+async function deriveWinnerAndPrize(signature, playerOne, playerTwo) {
+    const tx = await connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed'
+    });
+
+    if (!tx || !tx.meta) {
+        return null;
+    }
+
+    const accountKeys = tx.transaction.message.accountKeys.map(toBase58String);
+    const preBalances = tx.meta.preBalances || [];
+    const postBalances = tx.meta.postBalances || [];
+    const deltas = new Map();
+
+    accountKeys.forEach((key, index) => {
+        if (!key) return;
+        const delta = (postBalances[index] || 0) - (preBalances[index] || 0);
+        deltas.set(key, delta);
+    });
+
+    const p1 = playerOne.toBase58();
+    const p2 = playerTwo.toBase58();
+    const p1Delta = deltas.get(p1) || 0;
+    const p2Delta = deltas.get(p2) || 0;
+
+    if (p1Delta <= 0 && p2Delta <= 0) {
+        return null;
+    }
+
+    if (p1Delta >= p2Delta) {
+        return { winner: p1, prize: Math.max(p1Delta, 0) };
+    }
+
+    return { winner: p2, prize: Math.max(p2Delta, 0) };
 }
 
 async function getSeed(gameId) {
@@ -61,7 +123,7 @@ async function getSeed(gameId) {
 
 // --- API ENDPOINT: GENERATE HASH ---
 
-app.post('/generate-game', (req, res) => {
+app.post('/generate-game', async (req, res) => {
     try {
         const { gameId } = req.body;
         if (!gameId) return res.status(400).json({ error: "Missing gameId" });
@@ -73,7 +135,7 @@ app.post('/generate-game', (req, res) => {
         const serverHash = crypto.createHash('sha256').update(serverSeed).digest();
 
         // 3. Store seed securely
-        saveSeed(gameId.toString(), serverSeed.toString('hex'));
+        await saveSeed(gameId.toString(), serverSeed.toString('hex'));
 
         console.log(`🆕 Game Created: ${gameId} | Hash: ${serverHash.toString('hex').slice(0, 10)}...`);
 
@@ -83,7 +145,45 @@ app.post('/generate-game', (req, res) => {
     }
 });
 
+
+
+app.post('/broadcast', async (req, res) => {
+  try {
+    console.log('📡 /broadcast hit');
+    const { transaction } = req.body;
+    if (!transaction) return res.status(400).json({ error: 'Missing transaction' });
+
+    const txBuffer = Buffer.from(transaction, 'base64');
+    console.log('📡 tx buffer length:', txBuffer.length);
+
+    const signature = await connection.sendRawTransaction(txBuffer, {
+      skipPreflight: true,
+      preflightCommitment: 'confirmed',
+    });
+
+    console.log('📡 sent, sig:', signature);
+
+    await connection.confirmTransaction(signature, 'confirmed');
+    console.log('📡 confirmed!');
+
+    res.json({ signature });
+  } catch (e) {
+    console.error('❌ Broadcast error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 // --- BOT LOGIC: AUTOMATED SETTLEMENT ---
+
+app.post('/rpc', async (req, res) => {
+  try {
+    const { method, params } = req.body;
+    const result = await connection.rpcRequest(method, params ?? []);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: { message: e.message } });
+  }
+});
+
 
 async function settleGame(gamePda, playerOne, playerTwo, gameId) {
     try {
@@ -91,7 +191,7 @@ async function settleGame(gamePda, playerOne, playerTwo, gameId) {
         const hexSeed = await getSeed(gameId.toString());
         
         if (!hexSeed) {
-            return console.log(`⚠️ No seed found for game ${gameId}, skipping.`);
+          //  return console.log(`⚠️ No seed found for game ${gameId}, skipping.`);
         }
 
         const serverSeed = Buffer.from(hexSeed, 'hex');
@@ -127,17 +227,29 @@ async function settleGame(gamePda, playerOne, playerTwo, gameId) {
             skipPreflight: false,
             preflightCommitment: 'confirmed'
         });
+
+        await connection.confirmTransaction(signature, 'confirmed');
+
+        const settlement = await deriveWinnerAndPrize(signature, playerOne, playerTwo);
+        if (!settlement) {
+            throw new Error(`Unable to derive winner for game ${gameId}`);
+        }
         
         console.log(`🎯 SETTLED Game ${gameId}. Sig: ${signature.slice(0, 10)}...`);
+        console.log(`🏆 Winner: ${settlement.winner} | Prize: ${settlement.prize}`);
 
-        // Keep the seed record so the frontend can verify older history entries later.
+        await saveSettlementResult(gameId, settlement.winner, settlement.prize);
+        console.log(`📝 Saved settlement for round ${gameId} to ${SETTLEMENTS_TABLE}`);
+
+        // Keep the seed record so frontend history can still reconstruct
+        // serverSeed and serverHash for settled games.
 
     } catch (err) {
         // Catch specific Solana errors (like 'already processed' if the bot double-fires)
         if (err.message.includes("already be processed")) {
              console.log(`ℹ️ Game ${gameId} already settled.`);
         } else {
-             console.error(`❌ Settle Error (${gameId}):`, err.message);
+           //  console.error(`❌ Settle Error (${gameId}):`, err.message);
         }
     }
 }
@@ -165,7 +277,7 @@ async function scanForJoins() {
                 const p2 = new PublicKey(data.slice(32, 64));
                 const gId = data.readBigUInt64LE(73);
 
-                console.log(`🎰 Match Found! GameID: ${gId}. Starting settlement...`);
+               // console.log(`🎰 Match Found! GameID: ${gId}. Starting settlement...`);
 
                 // 4. CRITICAL: Use 'await' here.
                 // This ensures the House wallet finishes one transaction 
