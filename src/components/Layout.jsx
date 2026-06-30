@@ -16,6 +16,7 @@ export default function Layout({ children, rightContent }) {
 
         <nav className="side-nav">
           <button className="side-nav-item" onClick={() => navigate('/')}>Flip</button>
+          <button className="side-nav-item" onClick={() => navigate('/game')}>Join Active Game</button>
          
           <button className="side-nav-item" onClick={() => navigate('/leaderboard')}>Leaderboard</button>
         </nav>

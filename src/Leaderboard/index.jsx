@@ -39,6 +39,8 @@ const parsePrizeToLamports = (prize) => {
 
 const formatSol = (lamports) => `${(Number(lamports) / SOL).toLocaleString(undefined, { maximumFractionDigits: 4 })} SOL`;
 
+const halveLamports = (lamports) => lamports / 2n;
+
 export default function Leaderboard() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
@@ -88,11 +90,12 @@ export default function Leaderboard() {
           if (!winner) continue;
 
           const prizeLamports = parsePrizeToLamports(row.prize);
-          totalVolumeLamports += prizeLamports;
+          const stakeLamports = halveLamports(prizeLamports);
+          totalVolumeLamports += stakeLamports;
           activeUsers.add(winner);
 
           wins.set(winner, (wins.get(winner) || 0) + 1);
-          earnings.set(winner, (earnings.get(winner) || 0n) + prizeLamports);
+          earnings.set(winner, (earnings.get(winner) || 0n) + stakeLamports);
         }
 
         const allPlayers = Array.from(activeUsers).map(address => ({
@@ -181,7 +184,10 @@ export default function Leaderboard() {
             <div style={{ color: '#8a939f' }}>No leaderboard entries available.</div>
           )}
           {!loading && players.slice(0,3).map((p, i) => (
-            <article key={p.address} className={`lb-podium-card` }>
+            <article
+              key={p.address}
+              className={`lb-podium-card ${i === 0 ? 'gold' : i === 1 ? 'silver' : 'bronze'}`}
+            >
               <div className="lb-avatar">👤</div>
               <div className="lb-address">{p.address}</div>
               <div className="lb-rank">#{i+1}</div>

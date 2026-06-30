@@ -11,8 +11,11 @@ const app = () => {
         <BrowserRouter>
             <Routes>
                 <Route path='/' element={<App />} />
+          <Route path='/game' element={<App />} />
                 <Route path='/verify' element={<VerifyGame />} />
+            <Route path='/verify-game' element={<VerifyGame />} />
             <Route path='/leaderboard' element={<Leaderboard />} />
+            <Route path='/leaderpage' element={<Leaderboard />} />
             </Routes>
         </BrowserRouter>
     </div>
